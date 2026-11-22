@@ -197,7 +197,8 @@ curl -s http://127.0.0.1:9932/v1/chat/completions -H 'Content-Type: application/
 
 Reasoning arrives in `reasoning_content`; send it back on assistant turns so the prefix cache keeps hitting.
 `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high`, `xhigh`. Sampling defaults to temp 1.0,
-top-p 1.0 (the model's recommendation). `"cache_prompt": false` forces a cold prefill. `GET /metrics` returns memory
+top-p 1.0 (the model's recommendation). `"cache_prompt": false` forces a cold prefill. `seed` makes a request reproducible;
+without it every request draws a fresh seed. `GET /metrics` returns memory
 use and the cached prefix length. The server only answers requests whose `Host` is a loopback name and POSTs with
 `Content-Type: application/json`, so a web page cannot drive it through DNS rebinding or a no-preflight form post.
 
@@ -235,6 +236,7 @@ python tests/test_server.py                                   # against a runnin
 python tests/tf_splitk.py --corpus docs.txt --ctx 20000       # teacher-forced KL, split-K vs stock vs prefill
 python bench/bench.py speed --corpus docs.txt --ablate lamq/ablate-dirs.npz
 python bench/bench.py abl   --corpus docs.txt --ablate lamq/ablate-dirs.npz
+python bench/loops.py --corpus docs.txt -n 6                   # long-context degeneration stats (no text printed)
 ```
 
 `--corpus` is any long text file; the numbers above used pi's documentation concatenated (not included).

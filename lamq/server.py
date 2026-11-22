@@ -32,6 +32,7 @@ import gc
 import hashlib
 import io
 import json
+import os
 import select
 import socket
 import sys
@@ -443,6 +444,7 @@ class Engine:
         j.temp = 1.0 if t is None else float(t)
         j.top_p = float(req.get("top_p") or 1.0)
         j.top_k = int(req.get("top_k") or 0)
+        j.seed = int(req["seed"]) if req.get("seed") is not None else None
         j.no_cache = req.get("cache_prompt") is False  # same convention as llama.cpp: start from an empty cache
         # Checkpoint at the end of the system prompt / tool declarations, i.e. just before the effort message that precedes the first user turn.
         j.sys_pos = 0
@@ -475,6 +477,9 @@ class Engine:
         lc.cache.reserve = min(self.a.ctx, n + min(j.max_new, RESERVE_AHEAD))
         # Image features for positions >= start, in placeholder order (start may fall inside an image)
         self.inj.load([f[max(0, start - s):] for s, e, f in j.spans if e > start])
+        # MLX's RNG state is thread-local and every request runs on a fresh thread, so without this each request would
+        # draw the same random stream: at temp 1.0 a retried or near-identical turn reproduced the same output exactly.
+        mx.random.seed(j.seed if j.seed is not None else int.from_bytes(os.urandom(8), "little"))
         mx.reset_peak_memory()
         t0 = time.perf_counter()
         cuts = sorted({p for p in (j.sys_pos, n - 1) if start < p < n} | {n})

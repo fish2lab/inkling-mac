@@ -121,6 +121,13 @@ else:
     out = r["msg"]["content"].lower()
     check("image understood", "red" in out and "circle" in out, out[:80])
 
+poem = [{"role": "user", "content": "Write a four-line poem about the sea."}]
+text = lambda r: r["msg"]["reasoning_content"] + "|" + r["msg"]["content"]  # noqa: E731
+outs = [text(chat(poem, max_tokens=60, temperature=1.0)) for _ in range(2)]
+check("temp 1.0 samples differ across requests", outs[0] != outs[1])
+outs = [text(chat(poem, max_tokens=60, temperature=1.0, seed=1234)) for _ in range(2)]
+check("same seed reproduces", outs[0] == outs[1])
+
 r = chat([{"role": "user", "content": "hello " * 90000}])
 check("context overflow -> 400", r.get("error") == 400 and "context size" in r["body"]["error"]["message"])
 
