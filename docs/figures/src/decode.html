@@ -1,0 +1,30 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Decode throughput</title><link rel="stylesheet" href="fig.css">
+<script src="fig.js"></script></head><body>
+<div class="fig" style="height:560px">
+  <div class="split">
+    <div class="dark">
+      <div class="tag">Decode throughput · M5 Pro 24 GB</div>
+      <h2>Long context,<br>still fast</h2>
+      <p class="lede">Tokens per second right after a cold prefill of each length. Split-K attention keeps the GPU busy when the KV cache is long.</p>
+      <div class="tabs">
+        <div class="t on"><span class="sw" style="background:var(--blue)"></span>lamq + split-K<small>this repo, ablation on</small></div>
+        <div class="t"><span class="sw" style="background:var(--g1)"></span>lamq, stock decode kernel<small><span class="mono">LAMQ_SPLITK=0</span></small></div>
+        <div class="t"><span class="sw" style="background:var(--g2)"></span>llama.cpp AD-IQ3_S<small>b12628 + #32752, 64K column measured at 60K</small></div>
+      </div>
+    </div>
+    <div class="light"><svg id="c" width="720" height="488"></svg>
+      <div class="mono" style="position:absolute;right:40px;top:40px;font-size:12px;color:var(--blue)">3.1× at 64K</div></div>
+  </div>
+</div>
+<script>
+groupedBars(document.getElementById("c"), {
+  W: 720, H: 488, groups: ["1K", "8K", "16K", "32K", "64K"], ymax: 46, ticks: [0, 10, 20, 30, 40], yfmt: (v) => v,
+  series: [
+    { name: "split-K", color: "#1f40ed", values: [41.9, 40.5, 38.3, 33.2, 30.5] },
+    { name: "stock", color: "#a39e98", values: [34.3, 26.8, 21.5, 15.3, 9.7] },
+    { name: "llama.cpp", color: "#d6d2cc", values: [29.9, 29.4, 28.2, 26.9, 23.8] },
+  ],
+});
+const s = document.getElementById("c");
+el("text", { x: 0, y: 12, class: "axis", text: "tokens / s, by context length" }, s);
+</script></body></html>

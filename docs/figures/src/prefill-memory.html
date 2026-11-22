@@ -1,0 +1,48 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Prefill and memory</title><link rel="stylesheet" href="fig.css"><script src="fig.js"></script></head><body>
+<div class="fig" style="height:540px; background:var(--panel)">
+  <div style="display:grid; grid-template-columns: 1fr 1fr; height:100%">
+    <div style="padding:44px 40px 28px">
+      <div class="tag">Prefill · average over the prompt, empty cache</div>
+      <h2 style="font-size:34px; margin-top:12px">About 3× faster prefill</h2>
+      <div class="legend" style="margin-top:16px"><span><i class="sw" style="background:var(--blue)"></i>lamq (this repo)</span><span><i class="sw" style="background:var(--g2)"></i>llama.cpp AD-IQ3_S</span></div>
+      <svg id="p" width="520" height="340" style="margin-top:8px"></svg>
+    </div>
+    <div style="padding:44px 40px 28px; border-left:1px solid var(--panel-line)">
+      <div class="tag">GPU memory · 24 GB machine</div>
+      <h2 style="font-size:34px; margin-top:12px">Room left for everything else</h2>
+      <div class="legend" style="margin-top:16px"><span><i class="sw" style="background:var(--blue)"></i>model loaded</span><span><i class="sw" style="background:var(--blue-mid)"></i>peak with long context / image</span></div>
+      <svg id="m" width="520" height="340" style="margin-top:8px"></svg>
+    </div>
+  </div>
+</div>
+<script>
+groupedBars(document.getElementById("p"), { W: 520, H: 340, groups: ["1K", "8K", "16K", "32K", "64K"], ymax: 1100, barW: 32,
+  ticks: [0, 250, 500, 750, 1000], series: [
+    { color: "#1f40ed", values: [997, 969, 900, 730, 639] },
+    { color: "#d6d2cc", values: [311, 300, 278, 241, 191] }] });
+el("text", { x: 0, y: 12, class: "axis", text: "tokens / s" }, document.getElementById("p"));
+
+const m = document.getElementById("m"), L = 196, R = 500, MAX = 22.35, X = (v) => L + (v / MAX) * (R - L);
+for (const t of [0, 5, 10, 15, 20]) {
+  el("line", { x1: X(t), x2: X(t), y1: 40, y2: 262, stroke: "#e4e1dc" }, m);
+  el("text", { x: X(t), y: 284, "text-anchor": "middle", class: "axis", text: t }, m);
+}
+el("text", { x: R, y: 304, "text-anchor": "end", class: "axis", text: "GiB" }, m);
+const rows = [
+  { name: "lamq (this repo)", sub: "12.8 peak at 65K context", base: 8.3, peak: 12.8, c1: "#1f40ed", c2: "#8fa2f6", lb: "8.3" },
+  { name: "llama.cpp AD-IQ3_S", sub: "16.3 peak with an image", base: 16.0, peak: 16.3, c1: "#a39e98", c2: "#d6d2cc", lb: "16.0" },
+];
+rows.forEach((r, i) => {
+  const y = 70 + i * 100, h = 40;
+  el("text", { x: 0, y: y + 18, class: "cat", text: r.name }, m);
+  el("text", { x: 0, y: y + 36, class: "axis", style: "font-family:var(--mono);font-size:11.5px", text: r.sub }, m);
+  bar(m, X(0), y, X(r.peak) - X(0), h, r.c2, true);
+  el("rect", { x: X(0), y, width: X(r.base) - X(0), height: h, fill: r.c1 }, m);
+  el("rect", { x: X(r.base), y, width: 2, height: h, fill: "#f7f6f3" }, m);
+  el("text", { x: X(r.base) - 8, y: y + 25, "text-anchor": "end", class: "val", style: "fill:#fff", text: r.lb }, m);
+});
+el("line", { x1: X(17.76), x2: X(17.76), y1: 34, y2: 262, stroke: "#111827", "stroke-dasharray": "3 3" }, m);
+el("text", { x: X(17.76) - 6, y: 28, "text-anchor": "end", class: "axis", text: "Metal working-set limit 17.8" }, m);
+el("line", { x1: X(MAX), x2: X(MAX), y1: 40, y2: 262, stroke: "#111827" }, m);
+el("text", { x: X(MAX), y: 254, "text-anchor": "end", class: "axis", text: "24 GB " }, m);
+</script></body></html>

@@ -1,0 +1,54 @@
+<!doctype html><html><head><meta charset="utf-8"><title>inkling-mac overview</title><link rel="stylesheet" href="fig.css"></head><body>
+<div class="fig" style="height:744px; padding:56px 64px 0">
+  <div class="tag">inkling-mac · Mac mini M5 Pro · 24 GB unified memory</div>
+  <h1 style="margin-top:16px">Inkling 2 Mini, local and fast</h1>
+  <p class="lede" style="margin-top:14px; max-width:780px">An 8.3 GiB quant on a patched MLX runtime, served over an OpenAI-compatible API with tools, reasoning, vision and an 80K context. Refusals removed at run time, without new weights.</p>
+
+  <div class="box" style="margin-top:34px; box-shadow:0 1px 3px rgba(0,0,0,.05)">
+    <div class="flow" style="grid-template-columns: 220px 1fr 1fr 230px">
+      <div class="col">
+        <div class="tag">Client</div>
+        <div class="name">pi coding agent</div>
+        <div class="sub">or any OpenAI client. The pi extension starts the backend on first use and stops it when the last pi exits.</div>
+      </div>
+      <div class="col">
+        <div class="tag">Server <span style="color:var(--faint)">· 127.0.0.1:9932</span></div>
+        <div class="name">lamq-server</div>
+        <div class="row" style="flex-wrap:wrap; gap:8px">
+          <span class="chip on">OpenAI API <span class="k">SSE</span></span>
+          <span class="chip on">tool calls</span>
+          <span class="chip on">reasoning_content</span>
+          <span class="chip acc">prefix cache + rollback <span class="k">ckpt</span></span>
+          <span class="chip on">idle unload <span class="k">10 min</span></span>
+        </div>
+      </div>
+      <div class="col">
+        <div class="tag">Runtime <span style="color:var(--faint)">· lamq + patch</span></div>
+        <div class="name">patched lamq on MLX</div>
+        <div class="row" style="flex-wrap:wrap; gap:8px">
+          <span class="chip acc">runtime refusal ablation</span>
+          <span class="chip acc">split-K decode attention</span>
+          <span class="chip acc">vision tower <span class="k">mmproj GGUF</span></span>
+          <span class="chip">fused lamq kernels</span>
+        </div>
+      </div>
+      <div class="col" style="background:var(--panel)">
+        <div class="tag">Hardware</div>
+        <div class="name">Metal · 20-core GPU</div>
+        <div class="sub">24 GB unified memory<br>17.8 GiB GPU working set<br><span class="mono">248 GiB/s</span> measured</div>
+      </div>
+    </div>
+    <div style="border-top:1px dashed var(--line); padding:12px 22px; font-size:13px; color:var(--muted)" class="row">
+      <span class="mono" style="font-size:11px; letter-spacing:.12em">FALLBACK</span>
+      <span>llama.cpp router <span class="mono">:9931</span> with AtomicChat AD-IQ3_S. The pi extension never keeps both backends in memory.</span>
+      <span style="margin-left:auto" class="row"><span class="dot"></span> added by this repo</span>
+    </div>
+  </div>
+
+  <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:0 28px; margin-top:28px">
+    <div class="stat"><div class="n blue">41.9<em>tok/s</em></div><div class="l">decode at 1K context</div></div>
+    <div class="stat"><div class="n">3.1×<em>at 64K</em></div><div class="l">decode vs the stock kernel, 9.7 → 30.5 tok/s</div></div>
+    <div class="stat"><div class="n">8.3<em>GiB</em></div><div class="l">resident; 12.8 GiB peak at 65K context</div></div>
+    <div class="stat"><div class="n">0/16<em>refusals</em></div><div class="l">from 10/16, harmless-prompt KL 0.012</div></div>
+  </div>
+</div></body></html>

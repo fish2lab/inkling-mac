@@ -1,0 +1,55 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Split-K decode attention</title><link rel="stylesheet" href="fig.css"><script src="fig.js"></script></head><body>
+<div class="fig" style="height:620px">
+  <div class="split">
+    <div class="dark">
+      <div class="tag">Split-K decode attention</div>
+      <h2>Spread one token's attention over the whole GPU</h2>
+      <p class="lede" style="font-size:15.5px">The stock kernel gives each of the 24 query heads one threadgroup that walks every key. At 64K keys, 24 long serial loops leave most of a 20-core GPU idle.</p>
+      <div class="tabs" style="gap:16px; margin-top:6px">
+        <div class="t on">1 · split the visible keys<small>up to 128 segments of ≥ 256 keys, honoring the sliding window and position mask</small></div>
+        <div class="t on">2 · share K/V across the GQA group<small>3 query heads per KV head: each K/V row is loaded once, used three times</small></div>
+        <div class="t on">3 · merge with log-sum-exp<small>a second kernel combines segment maxima, sums and partial outputs, then adds the attention sink</small></div>
+      </div>
+    </div>
+    <div class="light" style="padding:36px 40px 28px">
+      <svg id="s" width="720" height="556"></svg>
+    </div>
+  </div>
+</div>
+<script>
+const s = document.getElementById("s");
+// --- schematic
+el("text", { x: 0, y: 12, class: "axis", text: "STOCK · 24 threadgroups, each scans all keys", style: "font-family:var(--mono);font-size:11.5px;letter-spacing:.08em" }, s);
+for (let i = 0; i < 12; i++) el("rect", { x: 0, y: 24 + i * 7, width: 520, height: 5, rx: 1.5, fill: i < 3 ? "#a39e98" : "#d6d2cc" }, s);
+el("text", { x: 532, y: 52, class: "axis", text: "× 24 heads" }, s);
+el("text", { x: 532, y: 68, class: "axis", text: "one serial loop each" }, s);
+
+el("text", { x: 0, y: 132, class: "axis", text: "SPLIT-K · 8 KV heads × segments, 3 query heads per load", style: "font-family:var(--mono);font-size:11.5px;letter-spacing:.08em" }, s);
+const segW = 30.5;
+for (let r = 0; r < 8; r++) for (let c = 0; c < 16; c++)
+  el("rect", { x: c * (segW + 2), y: 144 + r * 11, width: segW, height: 9, rx: 1.5, fill: "#1f40ed", opacity: 0.55 + 0.45 * ((r + c) % 3 === 0) }, s);
+el("path", { d: "M 520 184 h 34", stroke: "#111827", "stroke-width": 1.2, fill: "none", "marker-end": "url(#ah)" }, s);
+const defs = el("defs", {}, s), mk = el("marker", { id: "ah", markerWidth: 8, markerHeight: 8, refX: 6, refY: 4, orient: "auto" }, defs);
+el("path", { d: "M0,0 L8,4 L0,8 z", fill: "#111827" }, mk);
+el("rect", { x: 562, y: 160, width: 150, height: 48, rx: 5, fill: "#fff", stroke: "#e5e7eb" }, s);
+el("text", { x: 637, y: 180, "text-anchor": "middle", class: "cat", style: "font-size:12.5px", text: "log-sum-exp merge" }, s);
+el("text", { x: 637, y: 197, "text-anchor": "middle", class: "axis", text: "+ attention sink" }, s);
+
+// --- latency
+const y0 = 288, L = 64, R = 640, MAX = 10, X = (v) => L + (v / MAX) * (R - L);
+el("line", { x1: 0, x2: 720, y1: y0 - 26, y2: y0 - 26, stroke: "#e2dfda" }, s);
+el("text", { x: 0, y: y0, class: "axis", text: "ONE ATTENTION CALL · ms · random inputs, 24 q heads / 8 KV heads, d = 128", style: "font-family:var(--mono);font-size:11.5px;letter-spacing:.08em" }, s);
+const rows = [["1K", 0.29, 0.19], ["4K", 0.71, 0.23], ["16K", 2.57, 0.50], ["64K", 9.67, 1.34]];
+rows.forEach(([k, a, b], i) => {
+  const y = y0 + 22 + i * 52;
+  el("text", { x: 0, y: y + 25, class: "cat", text: k }, s);
+  bar(s, X(0), y, Math.max(X(a) - X(0), 3), 20, "#d6d2cc", true);
+  bar(s, X(0), y + 22, Math.max(X(b) - X(0), 3), 20, "#1f40ed", true);
+  el("text", { x: X(a) + 8, y: y + 15, class: "val", style: "fill:#4b5563", text: a.toFixed(2) }, s);
+  el("text", { x: X(b) + 8, y: y + 37, class: "val", style: "font-weight:500", text: b.toFixed(2) + "  (" + (a / b).toFixed(1) + "× faster)" }, s);
+});
+const ly = y0 + 22 + 4 * 52 + 6;
+el("rect", { x: L, y: ly, width: 10, height: 10, rx: 2, fill: "#d6d2cc" }, s); el("text", { x: L + 16, y: ly + 9, class: "axis", text: "stock kernel" }, s);
+el("rect", { x: L + 110, y: ly, width: 10, height: 10, rx: 2, fill: "#1f40ed" }, s); el("text", { x: L + 126, y: ly + 9, class: "axis", text: "split-K" }, s);
+el("text", { x: 720, y: ly + 9, "text-anchor": "end", class: "axis", text: "max abs error ≤ 6e-5 vs stock" }, s);
+</script></body></html>

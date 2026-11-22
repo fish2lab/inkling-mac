@@ -4,6 +4,8 @@ Running **Inkling 2 Mini** as a local coding-agent model on a **24 GB Apple Sili
 18-core CPU, 20-core GPU, 24 GB). Everything needed to go from a clean machine to an OpenAI-compatible endpoint with
 tools, reasoning, vision and an 80K context, plus the measurements behind each choice.
 
+![inkling-mac: pi or any OpenAI client, lamq-server, patched lamq runtime on Metal](docs/figures/overview.png)
+
 | Piece | What it does |
 |---|---|
 | `lamq/lamq.patch` | Patch for the [LookAtMyQuant](https://github.com/ShinMegamiBoson/lookatmyquant) (lamq) MLX runtime: **runtime refusal ablation** and a **split-K decode-attention kernel** |
@@ -18,6 +20,10 @@ tools, reasoning, vision and an 80K context, plus the measurements behind each c
 
 lamq 8.9GB + runtime ablation + split-K, vs AtomicChat AD-IQ3_S on llama.cpp (b12628 + #32752, ubatch 128, KV q8_0).
 Single request; lamq greedy, llama.cpp temp 1.0.
+
+![Decode tokens per second by context length: lamq with split-K, lamq with the stock kernel, llama.cpp](docs/figures/decode.png)
+
+![Prefill throughput and GPU memory, lamq vs llama.cpp](docs/figures/prefill-memory.png)
 
 Prefill is the average over the whole prompt from an empty cache; decode is measured right after it, at that depth.
 
@@ -72,6 +78,8 @@ is, at a pinned commit, plus `lamq.patch`.
 
 ### Runtime refusal ablation
 
+![Where the refusal direction is projected out: embedding, attention o_proj, expert down_proj](docs/figures/ablation.png)
+
 AtomicChat's uncensored GGUF comes with a rank-1 LoRA. Inspecting it (`extract-dirs.py`) shows that in every layer the
 attention output projection and all 128 experts' down projections share one unit vector `b`, with `lora_a = -Wᵀb`. That
 makes the edit exactly a directional ablation `W' = (I - bbᵀ) W`: whatever a layer writes into the residual stream has
@@ -88,6 +96,8 @@ adding to the residual. The patch ablates *before* that post-conv, which is wher
 weights (on `o_proj` / `down_proj`). Cost: about 1.6 ms per decode step (~6%), none measurable in prefill.
 
 ### Split-K decode attention
+
+![Split-K decode attention: segments per KV head merged by log-sum-exp, and per-call latency](docs/figures/splitk.png)
 
 The stock lamq decode kernel gives each query head one threadgroup that walks the whole KV cache. With 24 heads that is
 24 threadgroups on a 20-core GPU: fine at 1K keys, but at 64K every threadgroup runs a long serial loop and the GPU is
@@ -206,6 +216,9 @@ python bench/bench.py abl   --corpus docs.txt --ablate lamq/ablate-dirs.npz
 ```
 
 `--corpus` is any long text file; the numbers above used pi's documentation concatenated (not included).
+
+The figures are HTML pages in `docs/figures/src/`; `docs/figures/render.sh` turns them into the PNGs with a headless
+Chromium (`CHROME=...`) and Pillow (`PY=...`).
 
 ## Responsible use
 

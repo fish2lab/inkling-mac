@@ -1,0 +1,26 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Runtime refusal ablation</title><link rel="stylesheet" href="fig.css"></head><body>
+<div class="fig" style="height:672px; padding:52px 64px 0">
+  <div class="tag">Runtime refusal ablation</div>
+  <h2 style="margin-top:14px">Project the refusal direction out of every residual write</h2>
+  <p class="lede" style="margin-top:12px; max-width:860px">AtomicChat's rank-1 LoRA is exactly <span class="mono" style="font-size:15px">W′ = (I − bbᵀ)W</span> on each layer's writes. Instead of merging it and requantizing, the patch applies <span class="formula">y ← y − b(bᵀy)</span> to the quantized model's actual outputs, before Inkling's post-conv.</p>
+
+  <div style="display:grid; grid-template-columns: minmax(0,1fr) 300px; gap:36px; margin-top:30px; align-items:start">
+    <div class="box" style="padding:22px 24px; display:flex; flex-direction:column; gap:16px">
+      <div class="row"><span class="tag" style="width:92px">embedding</span>
+        <span class="chip on">token lookup</span><span class="arrow">→</span><span class="chip acc">⊥ b<sub>emb</sub></span><span class="arrow">→</span><span class="chip">embed_norm</span><span class="arrow">→</span><span class="chip">residual</span></div>
+      <div class="row"><span class="tag" style="width:92px">attention</span>
+        <span class="chip on">attention</span><span class="arrow">→</span><span class="chip on">o_proj</span><span class="arrow">→</span><span class="chip acc">⊥ b<sub>ℓ</sub></span><span class="arrow">→</span><span class="chip">post-conv</span><span class="arrow">→</span><span class="chip">+ residual</span></div>
+      <div class="row"><span class="tag" style="width:92px">MoE</span>
+        <span class="chip on">8 experts</span><span class="arrow">→</span><span class="chip on">down_proj</span><span class="arrow">→</span><span class="chip acc">⊥ b<sub>ℓ</sub></span><span class="arrow">→</span><span class="chip">Σw, post-conv</span><span class="arrow">→</span><span class="chip">+ residual</span></div>
+      <div style="border-top:1px solid var(--line); padding-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:22px; font-size:13.5px; line-height:1.5; color:var(--ink-2)">
+        <div><div class="tag" style="margin-bottom:6px">merge, then quantize</div>Quantizing <span class="mono">(I − bbᵀ)W</span> only approximately removes <span class="mono">b</span>, and needs its own model file.</div>
+        <div><div class="tag" style="margin-bottom:6px; color:var(--blue)">project at run time</div>Exact on what the quantized model writes. One file serves base and ablated; <span class="mono">INKLING_ABLATE=</span> turns it off.</div>
+      </div>
+    </div>
+    <div style="display:flex; flex-direction:column">
+      <div class="stat" style="border-top:0; padding-top:0"><div class="n" style="font-size:38px; white-space:nowrap"><span style="color:var(--faint)">10/16</span> → <span class="blue">0/16</span></div><div class="l">refusals on 16 borderline probes</div></div>
+      <div class="stat"><div class="n">0.012<em>KL</em></div><div class="l">on harmless prompts vs the unablated model; top-1 agreement 96.3%. Quantization alone: 0.021</div></div>
+      <div class="stat"><div class="n">+0.3%<em>PPL</em></div><div class="l">2.723 → 2.732; about 1.6 ms per decoded token</div></div>
+    </div>
+  </div>
+</div></body></html>
