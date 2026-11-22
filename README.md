@@ -42,7 +42,7 @@ column), llama.cpp numbers from its server timings with the preset in `llama.cpp
 |---|---|---|
 | Weights on disk | 8.3 GiB + 0.6 GiB mmproj | 13.3 GB + 0.6 GiB mmproj |
 | GPU memory, model loaded | 8.3 GiB | 16.0 GiB (80K KV and compute buffers preallocated) |
-| GPU memory, peak | 12.8 GiB at 65K context | 16.3 GiB with a 2000×2000 image |
+| GPU memory, peak | 13.8 GiB at 80K context (process footprint ≤ 13.6 GB through a 1500-token generation at 56K) | 16.3 GiB with a 2000×2000 image |
 | Perplexity (8 × 4096 tokens of English technical docs, second half scored) | 2.732 (2.723 without ablation) | 2.674 (unablated Unsloth UD-Q3_K_XL: 2.650) |
 
 The lamq file is a lot smaller for a 2% perplexity cost; on a 24 GB machine that headroom is what lets an 80K
@@ -132,6 +132,26 @@ prompt and tool declarations and at the second-to-last prompt token, so both "ne
 roll back cheaply. Restored state is bit-identical to a fresh prefill. Images hash into the token key, so a different
 image never matches.
 
+A short request unrelated to a long live cache (a title, a side query) runs on a second, side cache so the long
+context survives. If the next request continues the side conversation further than the live one, the side cache is
+promoted and the old context is freed; otherwise a chat started after a long one would re-prefill from zero every turn.
+
+### Memory: KV growth and the allocator cache
+
+The stock runtime grew each global layer's KV buffer in 256-token steps, so every 256 decoded tokens it reallocated
+and copied all 8 global slots. MLX keeps freed buffers in its cache for reuse, but each reallocation asks for a larger
+size, so the freed ones are never reused; with MLX's default cache limit (as large as the memory limit) they piled up
+until the request ended and the server cleared them. On a 1500-token generation at 56K context the process footprint
+climbed from 12.0 to 17.2 GB (the Metal working-set limit is 17.8 GB) and fell back afterwards — the saw-tooth and
+sudden offloads seen in Activity Monitor.
+
+`lamq.patch` grows global KV in 8192-token steps and lets the server reserve room for the expected generation up front
+(`Inkling2Cache.reserve`), so a request reallocates at most once. The server caps the MLX cache at 1 GiB, sizes
+`mx.set_memory_limit` / `set_wired_limit` from `--mem-budget` (default 15.5 GiB), refuses prompts that would not fit
+the budget with a 400, and clamps `max_tokens` to the room left. Same test after the change: footprint stays between
+12.1 and 13.6 GB, decode 31.0 vs 31.9 tok/s (within run-to-run noise), and active memory rises in predictable
+0.25 GiB steps (8192 tokens × 32 KiB of global KV per token). `GET /metrics` reports active, cache and peak memory.
+
 ### Where decode time goes
 
 At 1K context one decode step takes ~23 ms. Streaming the 1.94 GiB of weights a token touches takes ~7.8 ms at the
@@ -177,7 +197,9 @@ curl -s http://127.0.0.1:9932/v1/chat/completions -H 'Content-Type: application/
 
 Reasoning arrives in `reasoning_content`; send it back on assistant turns so the prefix cache keeps hitting.
 `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high`, `xhigh`. Sampling defaults to temp 1.0,
-top-p 1.0 (the model's recommendation). `"cache_prompt": false` forces a cold prefill.
+top-p 1.0 (the model's recommendation). `"cache_prompt": false` forces a cold prefill. `GET /metrics` returns memory
+use and the cached prefix length. The server only answers requests whose `Host` is a loopback name and POSTs with
+`Content-Type: application/json`, so a web page cannot drive it through DNS rebinding or a no-preflight form post.
 
 ### With pi
 

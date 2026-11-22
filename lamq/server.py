@@ -21,7 +21,7 @@
   40 at 8K, 32 at 32K, 26–29 at 65K; prefill about 1000 tok/s at 1–5K and 580 averaged over 65K.
   The DSpark drafter isn't integrated: at pi's temp 1.0 it only clearly helps on code and math.
 
-Endpoints: GET /health, GET /v1/models (status.value: unloaded|loading|loaded), POST /v1/chat/completions
+Endpoints: GET /health, GET /metrics (memory), GET /v1/models (status.value: unloaded|loading|loaded), POST /v1/chat/completions
 (stream / non-stream, tools, image_url data URIs, chat_template_kwargs.reasoning_effort).
 """
 from __future__ import annotations
@@ -56,6 +56,12 @@ SPECIAL_MIN = 199999
 KINDS = {C_THINK: "reasoning_content", C_TEXT: "content", C_TOOL: "tool"}
 MAX_CKPTS = 3
 IMG_CACHE_TOKENS = 32768
+GIB = 2**30
+CACHE_LIMIT = 1 * GIB  # MLX keeps at most this much freed memory for reuse; the rest goes back to macOS at once
+# Memory the budget check adds on top of the model and its global KV: sliding-window KV and 3 checkpoints (~0.5 GiB
+# each), the vision tower (0.6), activations of a 2048-token prefill chunk (~1.6) and the buffer cache limit.
+FIXED_EXTRA = 3.2 * GIB + CACHE_LIMIT
+RESERVE_AHEAD = 8192  # global KV is reserved for the prompt plus this many generated tokens, then grows in 8192 steps
 
 
 def log(*a):
@@ -296,11 +302,12 @@ class Engine:
         self.a = a
         self.lock = threading.Lock()
         self.status = "unloaded"
-        self.m = self.tok = self.vision = self.live = None
+        self.m = self.tok = self.vision = self.live = self.side = None
         self.inj = ImageInjector()
         self.img_cache: OrderedDict[str, mx.array] = OrderedDict()
         self.last_used = time.monotonic()
-        threading.Thread(target=self._idle_loop, daemon=True).start()
+        if a.idle > 0:  # --idle 0: never unload
+            threading.Thread(target=self._idle_loop, daemon=True).start()
 
     # -- lifecycle
     def load(self):
@@ -317,13 +324,20 @@ class Engine:
                 unit = lambda v: mx.array((v / np.linalg.norm(v)).astype(np.float32))  # noqa: E731
                 m.set_ablation(([unit(v) for v in z["layers"]], unit(z["embd"])))
             m.embed.inject = self.inj
-            mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            budget = int(self.a.mem_budget * GIB)
+            mx.set_wired_limit(min(budget, mx.device_info()["max_recommended_working_set_size"]))
+            mx.set_memory_limit(budget)  # soft: MLX frees its cache and waits on queued work before going past it
+            mx.set_cache_limit(CACHE_LIMIT)
             # Warm up: JIT-compile the prefill and single-token decode kernels (otherwise the first request pays ~3 s)
             c = m.make_cache()
             mx.eval(m.forward_argmax([MSG_USER, C_TEXT] + [13225] * 300, cache=c)[0])
             mx.eval(m.forward_ordered_logits([END_MSG], cache=c)[0])
+            # Global (non-sliding) KV per token: 2 (K, V) x 8 KV heads x 128 x fp16 for every global visit
+            self.kv_per_token = 2 * 8 * 128 * 2 * sum(1 for s, kv in enumerate(c.kv_f16) if kv is not None and not c.kv_is_sliding[s])
             del c
-            self.m, self.tok, self.live = m, tok, LiveCache(m)
+            mx.clear_cache()
+            self.base_mem = mx.get_active_memory()
+            self.m, self.tok, self.live, self.side = m, tok, LiveCache(m), None
             self.status = "loaded"
             log(f"loaded in {time.perf_counter() - t:.1f}s, active {mx.get_active_memory() / 2**30:.2f} GiB, "
                 f"ablation {'on' if self.a.ablate else 'off'}")
@@ -332,7 +346,7 @@ class Engine:
             raise
 
     def unload(self):
-        self.m = self.tok = self.vision = self.live = None
+        self.m = self.tok = self.vision = self.live = self.side = None
         self.img_cache.clear()
         self.inj.load([])
         gc.collect()
@@ -419,6 +433,12 @@ class Engine:
         j = Job()
         j.ids, j.keys, j.spans = ids, keys, spans
         j.max_new = max(1, min(int(req.get("max_tokens") or req.get("max_completion_tokens") or 16384), self.a.ctx - n))
+        # Memory budget: model + fixed extras + global KV for prompt and output must fit; shorten the output if needed
+        room = int((self.a.mem_budget * GIB - self.base_mem - FIXED_EXTRA) // self.kv_per_token)
+        if n + 1 > room:
+            raise ApiError(400, f"the request exceeds the available context size: {n} prompt tokens, but the memory "
+                                f"budget of {self.a.mem_budget:g} GiB holds about {room} tokens", "exceed_context_size_error")
+        j.max_new = min(j.max_new, room - n)
         t = req.get("temperature")
         j.temp = 1.0 if t is None else float(t)
         j.top_p = float(req.get("top_p") or 1.0)
@@ -436,16 +456,23 @@ class Engine:
     # -- generation
     def run(self, j: Job, out) -> dict:
         m, n = self.m, len(j.ids)
-        lc = self.live
+        lc, promoted = self.live, False
         if j.no_cache:
             lc.reset()
+            self.side = None
+        elif self.side is not None and self.side.plan(j.keys)[0] > lc.plan(j.keys)[0]:
+            # The conversation that started on a side cache came back: it becomes the live cache and the old one is freed.
+            # Without this a new chat opened after a long one re-prefills from zero on every turn until it passes 8K tokens.
+            self.live, self.side, lc, promoted = self.side, None, self.side, True
         start, discard = lc.plan(j.keys)
         temp_cache = discard > 8192 and n - start < 8192 and common_prefix(lc.keys, j.keys) < n // 2
-        if temp_cache:  # a small, unrelated request (title, side query): leave the large live cache alone
-            lc = LiveCache(m)
+        if temp_cache:  # a small, unrelated request (title, side query): keep the large live cache, use the side slot
+            self.side = None
+            lc = self.side = LiveCache(m)
             start = 0
         else:
             start = lc.prepare(j.keys)
+        lc.cache.reserve = min(self.a.ctx, n + min(j.max_new, RESERVE_AHEAD))
         # Image features for positions >= start, in placeholder order (start may fall inside an image)
         self.inj.load([f[max(0, start - s):] for s, e, f in j.spans if e > start])
         mx.reset_peak_memory()
@@ -472,7 +499,7 @@ class Engine:
                             break
                 if aborted:
                     break
-                if tgt < n and not temp_cache:
+                if tgt < n:
                     lc.checkpoint()
             self.inj.load([])
             t1 = time.perf_counter()
@@ -517,18 +544,20 @@ class Engine:
                     finish = "tool_calls"
             t2 = time.perf_counter()
         except BaseException:
-            self.live = LiveCache(m) if self.m is not None else None  # cache state is unknown after a failure
+            if lc is self.side:  # cache state is unknown after a failure; a side cache leaves the live one intact
+                self.side = None
+            elif lc is self.live:
+                self.live = LiveCache(m) if self.m is not None else None
             raise
         finally:
             self.inj.load([])
-            mx.clear_cache()
             self.last_used = time.monotonic()
         nd = max(len(gen) - 1, 0)
         st = {"prompt_n": n - start, "cached": start, "prompt_ms": (t1 - t0) * 1e3, "predicted_n": len(gen),
               "predicted_ms": (t2 - t1) * 1e3, "finish": finish}
-        log(f"prompt {n} (cached {start}{', temp cache' if temp_cache else ''}) prefill {(n - start) / max(t1 - t0, 1e-9):.0f} tok/s | "
-            f"gen {len(gen)} at {nd / max(t2 - t1, 1e-9):.1f} tok/s | {finish} | active {mx.get_active_memory() / 2**30:.2f} GiB, "
-            f"peak {mx.get_peak_memory() / 2**30:.2f} GiB"
+        log(f"prompt {n} (cached {start}{', side cache' if temp_cache else ', promoted side cache' if promoted else ''}) prefill {(n - start) / max(t1 - t0, 1e-9):.0f} tok/s | "
+            f"gen {len(gen)} at {nd / max(t2 - t1, 1e-9):.1f} tok/s | {finish} | active {mx.get_active_memory() / GIB:.2f} GiB, "
+            f"cache {mx.get_cache_memory() / GIB:.2f} GiB, peak {mx.get_peak_memory() / GIB:.2f} GiB"
             f" ckpts {[k.pos for k in self.live.ckpts]}")
         return st
 
@@ -625,10 +654,26 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, code, msg, etype):
         self._json(code, {"error": {"code": code, "message": msg, "type": etype}})
 
+    def _local(self) -> bool:
+        # Reject other Host names: a web page that rebinds its own domain to 127.0.0.1 would otherwise be served
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return True
+        self._error(403, "only requests addressed to localhost are served", "permission_error")
+        return False
+
     def do_GET(self):
+        if not self._local():
+            return
         p = self.path.split("?")[0].rstrip("/")
         if p == "/health":
             self._json(200, {"status": "ok"})
+        elif p == "/metrics":
+            e = self.engine
+            self._json(200, {"status": e.status, "active_gib": round(mx.get_active_memory() / GIB, 3),
+                             "cache_gib": round(mx.get_cache_memory() / GIB, 3), "peak_gib": round(mx.get_peak_memory() / GIB, 3),
+                             "budget_gib": e.a.mem_budget, "ctx": e.a.ctx,
+                             "cached_tokens": len(e.live.keys) if e.live is not None else 0})
         elif p in ("/v1/models", "/models"):
             self._json(200, {"object": "list", "data": [{"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "lamq",
                                                           "status": {"value": self.engine.status}}]})
@@ -636,9 +681,14 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not found", "not_found_error")
 
     def do_POST(self):
+        if not self._local():
+            return
         p = self.path.split("?")[0].rstrip("/")
         if p not in ("/v1/chat/completions", "/chat/completions"):
             return self._error(404, "not found", "not_found_error")
+        # Browsers can send text/plain POSTs cross-origin without a preflight; JSON bodies can't be sent that way
+        if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+            return self._error(415, "Content-Type must be application/json", "invalid_request_error")
         try:
             req = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         except json.JSONDecodeError as e:
@@ -703,7 +753,9 @@ def main():
     ap.add_argument("--port", type=int, default=9932)
     ap.add_argument("--ctx", type=int, default=81920)
     ap.add_argument("--chunk", type=int, default=2048)
-    ap.add_argument("--idle", type=float, default=600, help="unload the model after this many idle seconds")
+    ap.add_argument("--idle", type=float, default=600, help="unload the model after this many idle seconds (0: never)")
+    ap.add_argument("--mem-budget", type=float, default=15.5,
+                    help="GiB the process may use; caps MLX's wired/memory limits and shortens outputs that would not fit")
     ap.add_argument("--preload", action="store_true")
     a = ap.parse_args()
     eng = Engine(a)

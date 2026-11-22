@@ -4,7 +4,7 @@
   python3 tests/test_server.py [--url http://127.0.0.1:9932]
 
 Covers: /health and /v1/models, streamed text with reasoning, tool calls, prefix-cache reuse across turns,
-cache_prompt:false, an image round trip, and the 400 context-overflow error.
+cache_prompt:false, an image round trip, the 400 context-overflow error, /metrics, and the Host / Content-Type guards.
 """
 import argparse
 import base64
@@ -65,6 +65,19 @@ def check(name, cond, detail=""):
 
 assert get("/health")["status"] == "ok"
 check("/v1/models lists the model", get("/v1/models")["data"][0]["id"] == MODEL)
+m = get("/metrics")
+check("/metrics reports memory", {"active_gib", "cache_gib", "peak_gib", "budget_gib"} <= m.keys(), f"budget {m.get('budget_gib')}")
+
+
+def status(path, data=None, headers=None):
+    try:
+        return urllib.request.urlopen(urllib.request.Request(URL + path, data, headers or {})).status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+check("foreign Host rejected (DNS rebinding)", status("/health", headers={"Host": "attacker.example"}) == 403)
+check("non-JSON POST rejected (CSRF)", status("/v1/chat/completions", b"{}", {"Content-Type": "text/plain"}) == 415)
 
 t = time.time()
 r = chat([{"role": "user", "content": "What is 17 * 23? Answer with just the number."}], effort="low")

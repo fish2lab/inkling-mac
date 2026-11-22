@@ -1,127 +1,11 @@
---- a/runtime_mlx/inkling/model.py	2026-11-22 19:06:20
-+++ b/runtime_mlx/inkling/model.py	2026-11-22 19:06:20
-@@ -177,6 +177,13 @@
- @lru_cache(maxsize=64)
- def _f32(val: float) -> mx.array:
-     return mx.array(val, dtype=mx.float32)
-+
-+
-+def ablate(y: mx.array, b: mx.array | None) -> mx.array:
-+    """Directional ablation y - b (b^T y); b is a unit float32 vector over the last axis."""
-+    if b is None:
-+        return y
-+    return (y - (y.astype(mx.float32) @ b)[..., None] * b).astype(y.dtype)
+diff --git a/runtime_mlx/inkling/fast_kernels.py b/runtime_mlx/inkling/fast_kernels.py
+index d15058c..fe156bf 100644
+--- a/runtime_mlx/inkling/fast_kernels.py
++++ b/runtime_mlx/inkling/fast_kernels.py
+@@ -4500,6 +4500,172 @@ def _make_gqa_relpos_flash_sdpa_kernel():
+     )
  
  
- def unweighted_rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
-@@ -562,6 +569,7 @@
-         cfg: Inkling2Config,
-     ):
-         self.cfg = cfg
-+        self.abl = None
-         self._fast = cfg.use_fast_metal and fast_luts is not None
-         self.router_w = router_w.astype(mx.float32)
-         self.router_w_f16 = router_w.astype(mx.float16) if self._fast else None
-@@ -681,6 +689,7 @@
-                 act_raw = None
-             y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, x_raw_f16=act_raw)
- 
-+        y_dn = ablate(y_dn, self.abl)
-         prev = cache.get_conv_prev(cache_slot, 3, 2304)
-         out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn)
-         cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
-@@ -719,6 +728,7 @@
-                 act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
-                 act_raw = None
-             y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, x_raw_f16=act_raw)
-+            y_dn = ablate(y_dn, self.abl)
-             out = mx.sum(y_dn.reshape(N, 8, 2304) * w_norm.reshape(N, 8, 1), axis=1)
-             return out.reshape(B, T, H)
- 
-@@ -781,6 +791,7 @@
-             )
-             y_dn_total = y_nv if y_dn_total is None else (y_dn_total + y_nv)
- 
-+        y_dn_total = ablate(y_dn_total, self.abl)
-         out = mx.sum(y_dn_total.reshape(N, K_top, H) * w_norm[:, :, None], axis=1)
-         return out.reshape(B, T, H)
- 
-@@ -791,6 +802,8 @@
-     """100% GPU-resident packed token embedding lookup (zero CPU sync on H=2304; NumPy fallback for mini tests)."""
- 
-     def __init__(self, packed_dir: Path, luts: dict[str, mx.array], embed_norm_w: mx.array, eps: float):
-+        self.abl = None
-+        self.inject = None
-         self.meta = json.loads((packed_dir / "embed_meta.json").read_text())
-         npz = np.load(packed_dir / "embed_packed.npz")
-         order = np.array(npz["order"], dtype=np.int32)
-@@ -905,12 +918,14 @@
-                 ids_mx, self.inv_order_mx, self.gpu_b_hi, self.gpu_b_dims,
-                 self.gpu_codes, self.gpu_scales, self.gpu_levels, self.gpu_rtr_luts, self.nb,
-             )
--            h = rht_out_2304_fast(q_out, self.gpu_signs_all, b_idx)[None, :, :]
--            return rms_norm(h, self.embed_norm_w, self.eps)
-+            h = ablate(rht_out_2304_fast(q_out, self.gpu_signs_all, b_idx)[None, :, :], self.abl)
-+            h = rms_norm(h, self.embed_norm_w, self.eps)
-+            return h if self.inject is None else self.inject(input_ids, h)
-         ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
-         rows = [self._decode_row(int(self.inv_order[int(t)])) for t in ids]
--        h = mx.stack(rows, axis=0)[None, :, :]
--        return rms_norm(h, self.embed_norm_w, self.eps)
-+        h = ablate(mx.stack(rows, axis=0)[None, :, :], self.abl)
-+        h = rms_norm(h, self.embed_norm_w, self.eps)
-+        return h if self.inject is None else self.inject(input_ids, h)
- 
- 
- class PackedLMHead:
-@@ -1308,6 +1323,7 @@
-         st: dict[str, mx.array],
-     ):
-         self.layer_idx = layer_idx
-+        self.abl = None
-         self.cfg = cfg
-         self._fast = cfg.use_fast_metal and fast_luts is not None
-         self.is_sliding = layer_idx in cfg.local_layer_ids
-@@ -1548,6 +1564,7 @@
-         o_out = self.o_stage.matmul_rotated_f16(o_rot, T, W_cached=o_w_cached)
-         if self.o_out_rot is not None:
-             o_out = rht_apply_out(o_out, self.o_out_rot)
-+        o_out = ablate(o_out, self.abl)
-         pa_prev = cache.get_conv_prev(cache_slot, 2, 2304)
-         if self.is_block_boundary:
-             h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=None, tree_lag=tree_lag)
-@@ -1655,7 +1672,7 @@
-         )
- 
-         gate = mx.sigmoid(self.o_gate(q_in))
--        attn_out = self.o_lin(attn_out * gate)
-+        attn_out = ablate(self.o_lin(attn_out * gate), self.abl)
-         attn_out = short_conv(attn_out, self.post_attn_conv_w, cache, cache_slot, 2)
- 
-         if self.is_block_boundary:
-@@ -1700,6 +1717,12 @@
-         self.message_in_q = self.st["model.message_input.query"].astype(mx.float32)
-         self.layers = [PackedDecoderLayer(i, self.cfg, self.packed_dir, self.luts, self.fast_luts, self.st) for i in range(self.cfg.num_hidden_layers)]
-         self.lm_head = PackedLMHead(self.packed_dir, self.luts, self.fast_luts, self.cfg.final_logit_softcapping, self.cfg.hidden_size)
-+
-+    def set_ablation(self, dirs: tuple[list[mx.array], mx.array] | None):
-+        """Project unit directions out of every residual write: dirs = (per-layer [24], embedding), or None to turn it off."""
-+        for i, L in enumerate(self.layers):
-+            L.abl = L.moe.abl = None if dirs is None else dirs[0][i]
-+        self.embed.abl = None if dirs is None else dirs[1]
- 
-     def make_cache(self) -> Inkling2Cache:
-         return Inkling2Cache(self.cfg)
---- a/runtime_mlx/inkling/fast_kernels.py	2026-11-22 19:33:27
-+++ b/runtime_mlx/inkling/fast_kernels.py	2026-11-22 19:33:27
-@@ -4496,10 +4496,176 @@
-         input_names=["q", "KV", "rel_st", "rel_proj_t", "sinks", "meta"],
-         output_names=["out"],
-         header=header,
-+        source=src,
-+    )
-+
-+
 +# ----------------------------------------------------------------------------- split-K GQA decode attention (local patch)
 +# Decode (T < 32, no tree): the stock kernel uses one threadgroup per (token, query head), i.e. 24 per token,
 +# and scans every key serially, so at long context most of the GPU sits idle (65K: 9.5 tok/s).
@@ -216,10 +100,10 @@
 +        name="ink_gqa_relpos_sdpa_splitk",
 +        input_names=["q", "KV", "rel_st", "rel_proj_t", "meta"],
 +        output_names=["part_ml", "part_acc"],
-         source=src,
-     )
- 
- 
++        source=src,
++    )
++
++
 +@lru_cache(maxsize=1)
 +def _make_gqa_split_combine_kernel():
 +    src = """
@@ -291,7 +175,7 @@
  def gqa_relpos_sinks_sdpa_fast(
      q: mx.array,
      KV_buf: mx.array,
-@@ -4532,6 +4698,8 @@
+@@ -4532,6 +4698,8 @@ def gqa_relpos_sinks_sdpa_fast(
              output_shapes=[(T, 3072)],
              output_dtypes=[mx.float32],
          )[0]
@@ -300,3 +184,153 @@
      ins = [
          q.reshape(-1), KV_buf.reshape(-1),
          rel_st.reshape(-1), rel_proj_t_f16.reshape(-1),
+diff --git a/runtime_mlx/inkling/model.py b/runtime_mlx/inkling/model.py
+index 075de5e..aabedab 100644
+--- a/runtime_mlx/inkling/model.py
++++ b/runtime_mlx/inkling/model.py
+@@ -179,6 +179,13 @@ def _f32(val: float) -> mx.array:
+     return mx.array(val, dtype=mx.float32)
+ 
+ 
++def ablate(y: mx.array, b: mx.array | None) -> mx.array:
++    """Directional ablation y - b (b^T y); b is a unit float32 vector over the last axis."""
++    if b is None:
++        return y
++    return (y - (y.astype(mx.float32) @ b)[..., None] * b).astype(y.dtype)
++
++
+ def unweighted_rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
+     return mx.fast.rms_norm(x.astype(mx.float32), None, eps)
+ 
+@@ -269,6 +276,9 @@ def _route_top8_compiled(flat: mx.array, router_w: mx.array, router_bias: mx.arr
+ 
+ # ----------------------------------------------------------------------------- 48-Visit KV + Conv Cache
+ 
++KV_GROW_STEP = 8192
++
++
+ class Inkling2Cache:
+     """KV + 4-slot causal conv state cache across all 48 logical layer visits, with O(1) speculative rollback.
+ 
+@@ -292,6 +302,11 @@ class Inkling2Cache:
+ 
+         self.conv_states: list[list[mx.array | None]] = [[None, None, None, None] for _ in range(n_slots)]
+         self.seq_len: int = 0
++        # Global-attention KV grows in KV_GROW_STEP-token steps (not 256) and to at least `reserve` tokens: every
++        # regrow allocates a new buffer and copies the old one, so 256-token steps meant 8 full-KV copies every 256
++        # decoded tokens, twice the global KV at each copy, and freed buffers of ever larger sizes piling up in the
++        # MLX buffer cache. Callers that know the final length (prompt + max_tokens) set `reserve` up front.
++        self.reserve: int = 0
+         self._spec_recording: bool = False
+         self._spec_base_seq: int = 0
+         self._spec_base_kv_len: list[int] = [0] * n_slots
+@@ -441,7 +456,10 @@ class Inkling2Cache:
+             cur = W
+         need = cur + T
+         if self.kv_f16[slot] is None or need > self.kv_cap[slot]:
+-            new_cap = ((need + 255) // 256) * 256
++            step = 256 if is_sliding else KV_GROW_STEP
++            new_cap = ((need + step - 1) // step) * step
++            if not is_sliding and self.reserve > need:
++                new_cap = max(new_cap, ((self.reserve + 255) // 256) * 256)
+             KV_new = mx.zeros((2, 8, new_cap, 128), dtype=mx.float16)
+             if self.kv_f16[slot] is not None and cur > 0:
+                 KV_new[:, :, :cur, :] = self.kv_f16[slot][:, :, :cur, :]
+@@ -562,6 +580,7 @@ class PackedMoE:
+         cfg: Inkling2Config,
+     ):
+         self.cfg = cfg
++        self.abl = None
+         self._fast = cfg.use_fast_metal and fast_luts is not None
+         self.router_w = router_w.astype(mx.float32)
+         self.router_w_f16 = router_w.astype(mx.float16) if self._fast else None
+@@ -681,6 +700,7 @@ class PackedMoE:
+                 act_raw = None
+             y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, x_raw_f16=act_raw)
+ 
++        y_dn = ablate(y_dn, self.abl)
+         prev = cache.get_conv_prev(cache_slot, 3, 2304)
+         out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn)
+         cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
+@@ -719,6 +739,7 @@ class PackedMoE:
+                 act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
+                 act_raw = None
+             y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, x_raw_f16=act_raw)
++            y_dn = ablate(y_dn, self.abl)
+             out = mx.sum(y_dn.reshape(N, 8, 2304) * w_norm.reshape(N, 8, 1), axis=1)
+             return out.reshape(B, T, H)
+ 
+@@ -781,6 +802,7 @@ class PackedMoE:
+             )
+             y_dn_total = y_nv if y_dn_total is None else (y_dn_total + y_nv)
+ 
++        y_dn_total = ablate(y_dn_total, self.abl)
+         out = mx.sum(y_dn_total.reshape(N, K_top, H) * w_norm[:, :, None], axis=1)
+         return out.reshape(B, T, H)
+ 
+@@ -791,6 +813,8 @@ class PackedEmbed:
+     """100% GPU-resident packed token embedding lookup (zero CPU sync on H=2304; NumPy fallback for mini tests)."""
+ 
+     def __init__(self, packed_dir: Path, luts: dict[str, mx.array], embed_norm_w: mx.array, eps: float):
++        self.abl = None
++        self.inject = None
+         self.meta = json.loads((packed_dir / "embed_meta.json").read_text())
+         npz = np.load(packed_dir / "embed_packed.npz")
+         order = np.array(npz["order"], dtype=np.int32)
+@@ -905,12 +929,14 @@ class PackedEmbed:
+                 ids_mx, self.inv_order_mx, self.gpu_b_hi, self.gpu_b_dims,
+                 self.gpu_codes, self.gpu_scales, self.gpu_levels, self.gpu_rtr_luts, self.nb,
+             )
+-            h = rht_out_2304_fast(q_out, self.gpu_signs_all, b_idx)[None, :, :]
+-            return rms_norm(h, self.embed_norm_w, self.eps)
++            h = ablate(rht_out_2304_fast(q_out, self.gpu_signs_all, b_idx)[None, :, :], self.abl)
++            h = rms_norm(h, self.embed_norm_w, self.eps)
++            return h if self.inject is None else self.inject(input_ids, h)
+         ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
+         rows = [self._decode_row(int(self.inv_order[int(t)])) for t in ids]
+-        h = mx.stack(rows, axis=0)[None, :, :]
+-        return rms_norm(h, self.embed_norm_w, self.eps)
++        h = ablate(mx.stack(rows, axis=0)[None, :, :], self.abl)
++        h = rms_norm(h, self.embed_norm_w, self.eps)
++        return h if self.inject is None else self.inject(input_ids, h)
+ 
+ 
+ class PackedLMHead:
+@@ -1308,6 +1334,7 @@ class PackedDecoderLayer:
+         st: dict[str, mx.array],
+     ):
+         self.layer_idx = layer_idx
++        self.abl = None
+         self.cfg = cfg
+         self._fast = cfg.use_fast_metal and fast_luts is not None
+         self.is_sliding = layer_idx in cfg.local_layer_ids
+@@ -1548,6 +1575,7 @@ class PackedDecoderLayer:
+         o_out = self.o_stage.matmul_rotated_f16(o_rot, T, W_cached=o_w_cached)
+         if self.o_out_rot is not None:
+             o_out = rht_apply_out(o_out, self.o_out_rot)
++        o_out = ablate(o_out, self.abl)
+         pa_prev = cache.get_conv_prev(cache_slot, 2, 2304)
+         if self.is_block_boundary:
+             h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=None, tree_lag=tree_lag)
+@@ -1655,7 +1683,7 @@ class PackedDecoderLayer:
+         )
+ 
+         gate = mx.sigmoid(self.o_gate(q_in))
+-        attn_out = self.o_lin(attn_out * gate)
++        attn_out = ablate(self.o_lin(attn_out * gate), self.abl)
+         attn_out = short_conv(attn_out, self.post_attn_conv_w, cache, cache_slot, 2)
+ 
+         if self.is_block_boundary:
+@@ -1701,6 +1729,12 @@ class Inkling2LoopPackedMLX:
+         self.layers = [PackedDecoderLayer(i, self.cfg, self.packed_dir, self.luts, self.fast_luts, self.st) for i in range(self.cfg.num_hidden_layers)]
+         self.lm_head = PackedLMHead(self.packed_dir, self.luts, self.fast_luts, self.cfg.final_logit_softcapping, self.cfg.hidden_size)
+ 
++    def set_ablation(self, dirs: tuple[list[mx.array], mx.array] | None):
++        """Project unit directions out of every residual write: dirs = (per-layer [24], embedding), or None to turn it off."""
++        for i, L in enumerate(self.layers):
++            L.abl = L.moe.abl = None if dirs is None else dirs[0][i]
++        self.embed.abl = None if dirs is None else dirs[1]
++
+     def make_cache(self) -> Inkling2Cache:
+         return Inkling2Cache(self.cfg)
+ 
