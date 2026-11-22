@@ -1,0 +1,18 @@
+#!/bin/sh
+# Start the OpenAI-compatible server: http://127.0.0.1:${INKLING_LAMQ_PORT:-9932}/v1, model id inkling-2-mini-lamq.
+# Extra arguments go to server.py (e.g. --preload, --idle 0 to never unload). Environment overrides:
+#   INKLING_MAC_HOME   install prefix used by install.sh (default ~/.local/share/inkling-mac)
+#   INKLING_LAMQ_MODEL lamq packed model directory   (default: pinned revision in the HF cache)
+#   INKLING_MMPROJ     vision projector GGUF          (default: pinned revision in the HF cache)
+#   INKLING_ABLATE     refusal directions npz; set to an empty string to serve the unmodified model
+HERE=$(cd "$(dirname "$0")" && pwd)
+HOME_DIR="${INKLING_MAC_HOME:-$HOME/.local/share/inkling-mac}"
+HUB="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+MODEL="${INKLING_LAMQ_MODEL:-$HUB/models--shinmegamiboson--Inkling-2-Mini-LookAtMyQuant-8.9GB/snapshots/1df3390e09eae0f4a93d4c05db80d1f054da7dbd}"
+MMPROJ="${INKLING_MMPROJ:-$HUB/models--AtomicChat--Inkling-2-Mini-Uncensored-GGUF/snapshots/40886ab636cabb4decf4998224f790b462ab048e/mmproj-Inkling-2-Mini-Uncensored-F16.gguf}"
+ABLATE="${INKLING_ABLATE-$HERE/ablate-dirs.npz}"
+[ -d "$MODEL" ] || { echo "model not found: $MODEL (run scripts/download-models.sh)" >&2; exit 1; }
+export HF_HUB_OFFLINE=1
+exec "$HOME_DIR/venv/bin/python" "$HERE/server.py" \
+  --model "$MODEL" --mmproj "$MMPROJ" --ablate "$ABLATE" \
+  --port "${INKLING_LAMQ_PORT:-9932}" --ctx 81920 --idle 600 "$@"

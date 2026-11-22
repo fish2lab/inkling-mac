@@ -1,0 +1,19 @@
+#!/bin/sh
+# llama.cpp router at 127.0.0.1:9931 serving models.ini.in (fallback backend).
+# The binary comes from install-llama.sh ($INKLING_MAC_HOME/llama.cpp/current/llama-server); override with LLAMA_SERVER_BIN.
+HERE=$(cd "$(dirname "$0")" && pwd)
+HOME_DIR="${INKLING_MAC_HOME:-$HOME/.local/share/inkling-mac}"
+BIN="${LLAMA_SERVER_BIN:-$HOME_DIR/llama.cpp/current/llama-server}"
+HUB="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+
+mkdir -p "$HOME_DIR/llama.cpp"
+PRESET="$HOME_DIR/llama.cpp/models.ini"
+sed "s#@HUB@#$HUB#g" "$HERE/models.ini.in" > "$PRESET"
+
+# LLAMA_ARG_* environment variables override preset entries of the same name; clear them
+for v in $(env | sed -n 's/^\(LLAMA_ARG_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+# point at an empty directory so the router doesn't list the same files from the HF cache a second time
+export HF_HUB_CACHE=/var/empty
+
+# host/port must be on the command line (the router ignores them in presets); exec keeps the pid = llama-server
+exec "$BIN" --models-preset "$PRESET" --models-max 1 --host 127.0.0.1 --port 9931 --metrics

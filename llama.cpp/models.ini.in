@@ -1,0 +1,57 @@
+; llama-server router-mode preset. llama.cpp/router fills in @HUB@ (the Hugging Face hub cache) and starts the router
+; at 127.0.0.1:9931. Model id "inkling-2-mini-uncensored"; OpenAI-compatible endpoint http://127.0.0.1:9931/v1.
+; This is the fallback backend; lamq-server is faster at every context length (see README).
+; Machine the numbers come from: Mac mini M5 Pro 24 GB, Metal working-set limit 17.76 GiB.
+version = 1
+
+[*]
+n-gpu-layers = 99
+flash-attn = on
+jinja = true
+; single user: one slot gets the whole KV
+parallel = 1
+warmup = true
+
+[inkling-2-mini-uncensored]
+; AtomicChat/Inkling-2-Mini-Uncensored-GGUF AD-IQ3_S (13.34 GB): their rank-1 refusal ablation, merged into the
+; weights before quantization. Their report: KLD 0.0235 / top-1 93.8% vs BF16; MMLU 80.65 -> 79.15.
+; Needs the upstream inkling2_loop layout (ggml-org/llama.cpp#32694, b12600+); install-llama.sh builds b12628 plus the
+; unmerged #32752 (chunked attention-mask construction), see that script for why.
+; Measured: PPL on the pi docs (8 x 4096 tokens) 2.674; the original Unsloth UD-Q3_K_XL gives 2.650.
+; Absolute paths on purpose: hf-repo would check with the Hub before loading, which stalls on a slow network.
+model = @HUB@/models--AtomicChat--Inkling-2-Mini-Uncensored-GGUF/snapshots/40886ab636cabb4decf4998224f790b462ab048e/Inkling-2-Mini-Uncensored-AD-IQ3_S.gguf
+; vision projector (318M, unmodified). F16 rather than BF16: F16 kernels are more mature on Metal
+mmproj = @HUB@/models--AtomicChat--Inkling-2-Mini-Uncensored-GGUF/snapshots/40886ab636cabb4decf4998224f790b462ab048e/mmproj-Inkling-2-Mini-Uncensored-F16.gguf
+; load on the first request; sleep (free memory) after 10 idle minutes
+load-on-startup = false
+sleep-idle-seconds = 600
+
+; 80K context, KV q8_0, ubatch 128, projector on GPU. The KV itself is small: only the 8 global-attention visits
+; (layers 5/23 once, layers 11/17 three times in the loop) keep full KV, ~32 KiB/token at f16, 1.4 GiB at 80K q8.
+; The compute buffer is what costs memory: the relative-position bias materializes n_ctx x ubatch x 24 heads.
+; #32752 builds it in chunks (llama-fit-params, MiB, model+KV+compute): 80K/ub128 15779 -> 15311.
+; Measured process GPU use, 80K + vision: 16.0 loaded / 16.3 peak with a 2000x2000 image (pi's resize cap).
+; A Metal OOM mid-run leaves the backend in an error state, so keep at least 1.5 GiB headroom.
+; Speed (b12628+#32752, 80K/ub128, cold prompt, temp 1.0, 256 generated):
+;   prompt   prefill tok/s   decode tok/s
+;   0.9K     311             29.9
+;   8K       300             29.4
+;   16K      278             28.2
+;   32K      241             26.9
+;   60K      191             23.8
+c = 81920
+ubatch-size = 128
+cache-type-k = q8_0
+cache-type-v = q8_0
+
+; host-memory prompt cache (#16391); the model pins ~16 GiB of GPU memory, so cap it at 2 GiB (one long session)
+cache-ram = 2048
+
+; No speculative decoding: the DSpark drafter was a net loss at temp 1.0 (code 27.6, prose 24.6, Chinese 17.3 tok/s
+; vs ~31 without). Likely cause: verifying 4 tokens of a MoE reads the union of 4 expert sets.
+
+; recommended sampling; client parameters override it
+temp = 1.0
+top-p = 1.0
+top-k = 0
+min-p = 0.0
