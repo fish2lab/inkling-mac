@@ -1,0 +1,10 @@
+loaded in 5.0s, active 8.13 GiB, ablation on
+chunk 0: running PPL 2.8092
+chunk 1: running PPL 2.9725
+chunk 2: running PPL 2.8494
+chunk 3: running PPL 2.6221
+chunk 4: running PPL 2.7083
+chunk 5: running PPL 2.8455
+chunk 6: running PPL 2.8106
+chunk 7: running PPL 2.7320
+PPL 2.7319786368842314

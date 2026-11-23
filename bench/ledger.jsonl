@@ -1,0 +1,1 @@
+{"t": "2026-11-23T21:35:11", "exp": "ppl-8.9-baseline", "var": "none", "metric": "ppl_pi_docs_ablated", "unit": "", "values": [2.732], "n": 1, "median": 2.732, "spread": 0.0, "lower_better": true, "verdict": "baseline", "note": "lamq 8.9GB, pi-docs-1.6.0 a1aa57c2, 8x4096; matches README 2.732, so corpus identical"}
