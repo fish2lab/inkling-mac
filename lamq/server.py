@@ -33,6 +33,7 @@ import hashlib
 import io
 import json
 import os
+import queue
 import select
 import socket
 import sys
@@ -318,8 +319,30 @@ class Engine:
         self.inj = ImageInjector()
         self.img_cache: OrderedDict[str, mx.array] = OrderedDict()
         self.last_used = time.monotonic()
+        # Run all MLX operations on one persistent thread: MLX compiled graphs (DSpark drafter, router) bind streams per-thread.
+        self._work_q: queue.Queue = queue.Queue()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
         if a.idle > 0:  # --idle 0: never unload
             threading.Thread(target=self._idle_loop, daemon=True).start()
+
+    def _worker_loop(self):
+        while True:
+            fn, args, res_q = self._work_q.get()
+            try:
+                res_q.put((True, fn(*args)))
+            except BaseException as e:  # noqa: BLE001
+                res_q.put((False, e))
+
+    def call(self, fn, *args):
+        if threading.current_thread() is self._worker:
+            return fn(*args)
+        res_q: queue.Queue = queue.Queue(maxsize=1)
+        self._work_q.put((fn, args, res_q))
+        ok, val = res_q.get()
+        if ok:
+            return val
+        raise val
 
     # -- lifecycle
     def load(self):
@@ -385,7 +408,7 @@ class Engine:
             if self.lock.acquire(blocking=False):
                 try:
                     if self.m is not None and time.monotonic() - self.last_used >= self.a.idle:
-                        self.unload()
+                        self.call(self.unload)
                 finally:
                     self.lock.release()
 
@@ -854,7 +877,7 @@ class Handler(BaseHTTPRequestHandler):
         with eng.lock:
             eng.last_used = time.monotonic()
             try:
-                job = eng.prepare(req)
+                job = eng.call(eng.prepare, req)
             except ApiError as e:
                 log(f"400: {e.message}")
                 return self._error(e.status, e.message, e.etype)
@@ -871,7 +894,7 @@ class Handler(BaseHTTPRequestHandler):
                 out = SSEOut(self, rid, created)
                 out.chunk({"role": "assistant", "content": ""})
                 try:
-                    st = eng.run(job, out)
+                    st = eng.call(eng.run, job, out)
                 except Exception as e:  # noqa: BLE001
                     log(f"500 in run: {e!r}")
                     out.send({"error": {"message": f"{type(e).__name__}: {e}", "type": "server_error"}})
@@ -886,7 +909,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 out = CollectOut(self)
                 try:
-                    st = eng.run(job, out)
+                    st = eng.call(eng.run, job, out)
                 except Exception as e:  # noqa: BLE001
                     log(f"500 in run: {e!r}")
                     return self._error(500, f"{type(e).__name__}: {e}", "server_error")
@@ -919,7 +942,7 @@ def main():
     Handler.engine = eng
     if a.preload:
         with eng.lock:
-            eng.load()
+            eng.call(eng.load)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
     log(f"listening on http://{a.host}:{a.port}/v1 (model {MODEL_ID}, ctx {a.ctx}, idle unload {a.idle:.0f}s)")
