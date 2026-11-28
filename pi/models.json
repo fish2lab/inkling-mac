@@ -21,7 +21,47 @@
       "models": [
         {
           "id": "inkling-2-mini-lamq",
-          "name": "Inkling 2 Mini lamq 8.9GB + runtime uncensor (MLX, 80K, vision)",
+          "name": "Inkling 2 Mini lamq 11.2GB v5 + runtime uncensor + DSpark (MLX, 80K, vision)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "contextWindow": 81920,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    },
+    "splash": {
+      "name": "inkling-mac Splash (C++ Metal + DFlash2)",
+      "baseUrl": "http://127.0.0.1:9933/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": {
+        "supportsStore": false,
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "maxTokensField": "max_tokens",
+        "thinkingFormat": "openai"
+      },
+      "models": [
+        {
+          "id": "inkling-2-mini-splash",
+          "name": "Inkling 2 Mini Uncensored AD-IQ3_S + DFlash2 (Splash, 80K, vision)",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",

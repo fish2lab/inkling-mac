@@ -1,194 +1,37 @@
-diff --git a/runtime_mlx/inkling/fast_kernels.py b/runtime_mlx/inkling/fast_kernels.py
-index d15058c..fe156bf 100644
---- a/runtime_mlx/inkling/fast_kernels.py
-+++ b/runtime_mlx/inkling/fast_kernels.py
-@@ -4500,6 +4500,172 @@ def _make_gqa_relpos_flash_sdpa_kernel():
-     )
+diff --git a/runtime_mlx/inkling/batch.py b/runtime_mlx/inkling/batch.py
+index c054704..319a0bf 100644
+--- a/runtime_mlx/inkling/batch.py
++++ b/runtime_mlx/inkling/batch.py
+@@ -64,6 +64,7 @@ from .kernels import rht_apply_out
+ from .model import (
+     Inkling2Config,
+     Inkling2LoopPackedMLX,
++    ablate,
+     _msg_1x_compiled,
+     _msg_3x_shared_h_compiled,
+     _msg_3x_split_h_compiled,
+@@ -1440,6 +1441,7 @@ def forward_batched(
+         o_out = L.o_stage.matmul_rotated_f16(o_rot, T, W_cached=wo_c)
+         if L.o_out_rot is not None:
+             o_out = rht_apply_out(o_out, L.o_out_rot)
++        o_out = ablate(o_out, L.abl)
+         pa_prev = _gather_conv(c_slot, 2)
+         if L.is_block_boundary:
+             if single_pf:
+@@ -1503,7 +1505,7 @@ def forward_batched(
+         else:
+             act_rot = swiglu_rht_1152_fast(y_gu, moe.dn_signs_in, cfg.mlp_gate_softcap, cfg.mlp_up_softcap, out_dtype=mx.float16, eids_flat=eids_flat if dyn else None)
+             act_raw = None
+-        y_dn = moe.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, dynamic_routing=dyn, x_raw_f16=act_raw)
++        y_dn = ablate(moe.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, dynamic_routing=dyn, x_raw_f16=act_raw), moe.abl)
  
- 
-+# ----------------------------------------------------------------------------- split-K GQA decode attention (local patch)
-+# Decode (T < 32, no tree): the stock kernel uses one threadgroup per (token, query head), i.e. 24 per token,
-+# and scans every key serially, so at long context most of the GPU sits idle (65K: 9.5 tok/s).
-+# Here: one threadgroup per (token, KV head, key segment). The 3 query heads sharing a KV head reuse each K/V load.
-+# Each segment writes (m, l, acc); a second kernel merges the segments with log-sum-exp and adds the attention sink.
-+import os as _os
-+
-+SPLITK_MIN_CHUNK = int(_os.environ.get("LAMQ_SPLITK_MIN_CHUNK", "256"))
-+SPLITK_MAX_SPLIT = int(_os.environ.get("LAMQ_SPLITK_MAX_SPLIT", "128"))
-+SPLITK_ON = _os.environ.get("LAMQ_SPLITK", "1") != "0"
-+
-+
-+@lru_cache(maxsize=1)
-+def _make_gqa_relpos_split_kernel():
-+    src = """
-+    const uint s = threadgroup_position_in_grid.x;
-+    const uint tk = threadgroup_position_in_grid.y;
-+    const uint t = tk / 8u;
-+    const uint kvh = tk - t * 8u;
-+    const uint simd = simdgroup_index_in_threadgroup; // 0..3
-+    const uint lane = thread_index_in_simdgroup;      // 0..31 -> 4 dims each
-+
-+    const uint kv_len = meta[1], kv_start = meta[2];
-+    const uint q_pos = meta[3] + t;
-+    const uint kv_cap = meta[4], is_sliding = meta[5], nsplit = meta[6], chunk = meta[7];
-+
-+    const int min_pos = is_sliding ? ((int)q_pos - 1023) : 0;
-+    const uint j_lo0 = (min_pos > (int)kv_start) ? (uint)(min_pos - (int)kv_start) : 0u;
-+    const uint j_hi0 = min(kv_len, (q_pos >= kv_start) ? (q_pos - kv_start + 1u) : 0u);
-+    const uint j_lo = j_lo0 + s * chunk;
-+    const uint j_hi = min(j_hi0, j_lo + chunk);
-+
-+    float4 qv[3];
-+    float4 rs[3][4];
-+    for (uint g = 0; g < 3u; g++) {
-+        const uint h = kvh * 3u + g;
-+        qv[g] = ((const device float4*)(q + ((ulong)t * 24u + h) * 128u))[lane] * (1.0f / 11.313708498984761f);
-+        const device float4* rsp = (const device float4*)(rel_st + ((ulong)t * 24u + h) * 16u);
-+        rs[g][0] = rsp[0]; rs[g][1] = rsp[1]; rs[g][2] = rsp[2]; rs[g][3] = rsp[3];
-+    }
-+    const device half4* Kp = (const device half4*)(KV + (ulong)kvh * kv_cap * 128u);
-+    const device half4* Vp = (const device half4*)(KV + (ulong)(8u + kvh) * kv_cap * 128u);
-+
-+    float m[3] = {-1e30f, -1e30f, -1e30f};
-+    float l[3] = {0.0f, 0.0f, 0.0f};
-+    float4 acc[3] = {float4(0.0f), float4(0.0f), float4(0.0f)};
-+
-+    for (uint j = j_lo + simd; j < j_hi; j += 4u) {
-+        const uint dist = q_pos - (kv_start + j);
-+        const float4 k4 = float4(Kp[(ulong)j * 32u + lane]);
-+        float3 sc = simd_sum(float3(dot(qv[0], k4), dot(qv[1], k4), dot(qv[2], k4)));
-+        if (dist < 1024u) {
-+            const device half4* rp = (const device half4*)(rel_proj_t + (ulong)dist * 16u);
-+            const float4 r0 = float4(rp[0]), r1 = float4(rp[1]), r2 = float4(rp[2]), r3 = float4(rp[3]);
-+            for (uint g = 0; g < 3u; g++)
-+                sc[g] += dot(rs[g][0], r0) + dot(rs[g][1], r1) + dot(rs[g][2], r2) + dot(rs[g][3], r3);
-+        }
-+        const float4 v4 = float4(Vp[(ulong)j * 32u + lane]);
-+        for (uint g = 0; g < 3u; g++) {
-+            const float m_new = max(m[g], sc[g]);
-+            const float alpha = metal::precise::exp(m[g] - m_new);
-+            const float p = metal::precise::exp(sc[g] - m_new);
-+            l[g] = l[g] * alpha + p;
-+            acc[g] = acc[g] * alpha + p * v4;
-+            m[g] = m_new;
-+        }
-+    }
-+
-+    threadgroup float tg_m[3][4], tg_l[3][4];
-+    threadgroup float4 tg_a[3][4][32];
-+    for (uint g = 0; g < 3u; g++) {
-+        if (lane == 0u) { tg_m[g][simd] = m[g]; tg_l[g][simd] = l[g]; }
-+        tg_a[g][simd][lane] = acc[g];
-+    }
-+    threadgroup_barrier(mem_flags::mem_threadgroup);
-+    if (simd < 3u) {
-+        const uint g = simd;
-+        float m_all = max(max(tg_m[g][0], tg_m[g][1]), max(tg_m[g][2], tg_m[g][3]));
-+        float l_all = 0.0f;
-+        float4 a_all = float4(0.0f);
-+        for (uint w = 0; w < 4u; w++) {
-+            const float sc = metal::precise::exp(tg_m[g][w] - m_all);
-+            l_all += tg_l[g][w] * sc;
-+            a_all += tg_a[g][w][lane] * sc;
-+        }
-+        const ulong row = ((ulong)t * 24u + kvh * 3u + g) * nsplit + s;
-+        if (lane == 0u) { part_ml[row * 2u] = m_all; part_ml[row * 2u + 1u] = l_all; }
-+        ((device float4*)(part_acc + row * 128u))[lane] = a_all;
-+    }
-+    """
-+    return mx.fast.metal_kernel(
-+        name="ink_gqa_relpos_sdpa_splitk",
-+        input_names=["q", "KV", "rel_st", "rel_proj_t", "meta"],
-+        output_names=["part_ml", "part_acc"],
-+        source=src,
-+    )
-+
-+
-+@lru_cache(maxsize=1)
-+def _make_gqa_split_combine_kernel():
-+    src = """
-+    const uint ht = threadgroup_position_in_grid.y;
-+    const uint t = ht / 24u;
-+    const uint h = ht - t * 24u;
-+    const uint simd = simdgroup_index_in_threadgroup;
-+    const uint lane = thread_index_in_simdgroup;
-+    const uint tid = simd * 32u + lane;
-+    const uint nsplit = meta[0];
-+
-+    const device float2* qin2 = (const device float2*)(q_in + (ulong)t * 2304u);
-+    const device half2* sw2 = (const device half2*)(sink_w + (ulong)h * 2304u);
-+    float sk_part = 0.0f;
-+    for (uint i = 0; i < 9u; i++) {
-+        const uint idx = tid + i * 128u;
-+        sk_part += dot(qin2[idx], float2(sw2[idx]));
-+    }
-+    sk_part = simd_sum(sk_part);
-+    threadgroup float tg_sk[4];
-+    if (lane == 0u) tg_sk[simd] = sk_part;
-+    threadgroup_barrier(mem_flags::mem_threadgroup);
-+    if (simd == 0u) {
-+        const float sk = tg_sk[0] + tg_sk[1] + tg_sk[2] + tg_sk[3];
-+        const ulong base = ((ulong)t * 24u + h) * nsplit;
-+        float m_all = sk;
-+        for (uint s = 0; s < nsplit; s++) m_all = max(m_all, part_ml[(base + s) * 2u]);
-+        float l_all = metal::precise::exp(sk - m_all);
-+        float4 a_all = float4(0.0f);
-+        for (uint s = 0; s < nsplit; s++) {
-+            const float sc = metal::precise::exp(part_ml[(base + s) * 2u] - m_all);
-+            l_all += part_ml[(base + s) * 2u + 1u] * sc;
-+            a_all += ((const device float4*)(part_acc + (base + s) * 128u))[lane] * sc;
-+        }
-+        ((device float4*)(out + ((ulong)t * 24u + h) * 128u))[lane] = a_all * (1.0f / l_all);
-+    }
-+    """
-+    return mx.fast.metal_kernel(
-+        name="ink_gqa_split_combine",
-+        input_names=["part_ml", "part_acc", "q_in", "sink_w", "meta"],
-+        output_names=["out"],
-+        source=src,
-+    )
-+
-+
-+def gqa_relpos_sinks_sdpa_splitk(q, KV_buf, rel_st, rel_proj_t_f16, q_in, sink_w_f16, T, kv_len, kv_start, q_pos0, kv_cap, is_sliding):
-+    lo = max((q_pos0 - 1023) if is_sliding else 0, kv_start) - kv_start
-+    hi = min(kv_len, max(q_pos0 + T - 1 - kv_start + 1, 0))
-+    R = max(hi - lo, 1)
-+    nsplit = max(1, min(SPLITK_MAX_SPLIT, -(-R // SPLITK_MIN_CHUNK)))
-+    chunk = -(-R // nsplit)
-+    part_ml, part_acc = _make_gqa_relpos_split_kernel()(
-+        inputs=[q.reshape(-1), KV_buf.reshape(-1), rel_st.reshape(-1), rel_proj_t_f16.reshape(-1),
-+                _u32(T, kv_len, kv_start, q_pos0, kv_cap, int(is_sliding), nsplit, chunk)],
-+        grid=(128 * nsplit, 8 * T, 1),
-+        threadgroup=(128, 1, 1),
-+        output_shapes=[(T * 24 * nsplit * 2,), (T * 24 * nsplit * 128,)],
-+        output_dtypes=[mx.float32, mx.float32],
-+    )
-+    return _make_gqa_split_combine_kernel()(
-+        inputs=[part_ml, part_acc, q_in.reshape(-1), sink_w_f16.reshape(-1), _u32(nsplit)],
-+        grid=(128, 24 * T, 1),
-+        threadgroup=(128, 1, 1),
-+        output_shapes=[(T, 3072)],
-+        output_dtypes=[mx.float32],
-+    )[0]
-+
-+
- def gqa_relpos_sinks_sdpa_fast(
-     q: mx.array,
-     KV_buf: mx.array,
-@@ -4532,6 +4698,8 @@ def gqa_relpos_sinks_sdpa_fast(
-             output_shapes=[(T, 3072)],
-             output_dtypes=[mx.float32],
-         )[0]
-+    if SPLITK_ON and not tree_mode:
-+        return gqa_relpos_sinks_sdpa_splitk(q, KV_buf, rel_st, rel_proj_t_f16, q_in, sink_w_f16, T, kv_len, kv_start, q_pos0, kv_cap, is_sliding)
-     ins = [
-         q.reshape(-1), KV_buf.reshape(-1),
-         rel_st.reshape(-1), rel_proj_t_f16.reshape(-1),
+         pm_prev = _gather_conv(c_slot, 3)
+         if single_pf:
 diff --git a/runtime_mlx/inkling/model.py b/runtime_mlx/inkling/model.py
-index 075de5e..aabedab 100644
+index 94d3716..7f4befb 100644
 --- a/runtime_mlx/inkling/model.py
 +++ b/runtime_mlx/inkling/model.py
-@@ -179,6 +179,13 @@ def _f32(val: float) -> mx.array:
+@@ -267,6 +267,13 @@ def _f32(val: float) -> mx.array:
      return mx.array(val, dtype=mx.float32)
  
  
@@ -202,7 +45,7 @@ index 075de5e..aabedab 100644
  def unweighted_rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
      return mx.fast.rms_norm(x.astype(mx.float32), None, eps)
  
-@@ -269,6 +276,9 @@ def _route_top8_compiled(flat: mx.array, router_w: mx.array, router_bias: mx.arr
+@@ -357,6 +364,9 @@ def _route_top8_compiled(flat: mx.array, router_w: mx.array, router_bias: mx.arr
  
  # ----------------------------------------------------------------------------- 48-Visit KV + Conv Cache
  
@@ -212,19 +55,27 @@ index 075de5e..aabedab 100644
  class Inkling2Cache:
      """KV + 4-slot causal conv state cache across all 48 logical layer visits, with O(1) speculative rollback.
  
-@@ -292,6 +302,11 @@ class Inkling2Cache:
+@@ -388,6 +398,7 @@ class Inkling2Cache:
  
          self.conv_states: list[list[mx.array | None]] = [[None, None, None, None] for _ in range(n_slots)]
          self.seq_len: int = 0
-+        # Global-attention KV grows in KV_GROW_STEP-token steps (not 256) and to at least `reserve` tokens: every
-+        # regrow allocates a new buffer and copies the old one, so 256-token steps meant 8 full-KV copies every 256
-+        # decoded tokens, twice the global KV at each copy, and freed buffers of ever larger sizes piling up in the
-+        # MLX buffer cache. Callers that know the final length (prompt + max_tokens) set `reserve` up front.
 +        self.reserve: int = 0
          self._spec_recording: bool = False
          self._spec_base_seq: int = 0
          self._spec_base_kv_len: list[int] = [0] * n_slots
-@@ -441,7 +456,10 @@ class Inkling2Cache:
+@@ -672,7 +683,10 @@ class Inkling2Cache:
+                     continue
+                 buffer = buffers[slot]
+                 if buffer is None or need > buffer.shape[2]:
+-                    capacity = ((need + 255) // 256) * 256
++                    step = 256 if is_sliding else KV_GROW_STEP
++                    capacity = ((need + step - 1) // step) * step
++                    if not is_sliding and self.reserve > need:
++                        capacity = max(capacity, ((self.reserve + 255) // 256) * 256)
+                     larger = mx.zeros((*new.shape[:2], capacity, new.shape[-1]), dtype=new.dtype)
+                     if buffer is not None and cur > 0:
+                         larger[:, :, :cur, :] = buffer[:, :, :cur, :]
+@@ -697,7 +711,10 @@ class Inkling2Cache:
              cur = W
          need = cur + T
          if self.kv_f16[slot] is None or need > self.kv_cap[slot]:
@@ -236,7 +87,7 @@ index 075de5e..aabedab 100644
              KV_new = mx.zeros((2, 8, new_cap, 128), dtype=mx.float16)
              if self.kv_f16[slot] is not None and cur > 0:
                  KV_new[:, :, :cur, :] = self.kv_f16[slot][:, :, :cur, :]
-@@ -562,6 +580,7 @@ class PackedMoE:
+@@ -836,6 +853,7 @@ class PackedMoE:
          cfg: Inkling2Config,
      ):
          self.cfg = cfg
@@ -244,7 +95,7 @@ index 075de5e..aabedab 100644
          self._fast = cfg.use_fast_metal and fast_luts is not None
          self.router_w = router_w.astype(mx.float32)
          self.router_w_f16 = router_w.astype(mx.float16) if self._fast else None
-@@ -681,6 +700,7 @@ class PackedMoE:
+@@ -969,6 +987,7 @@ class PackedMoE:
                  act_raw = None
              y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, x_raw_f16=act_raw)
  
@@ -252,15 +103,16 @@ index 075de5e..aabedab 100644
          prev = cache.get_conv_prev(cache_slot, 3, 2304)
          out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn)
          cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
-@@ -719,6 +739,7 @@ class PackedMoE:
+@@ -1006,7 +1025,7 @@ class PackedMoE:
+             else:
                  act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
                  act_raw = None
-             y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, x_raw_f16=act_raw)
-+            y_dn = ablate(y_dn, self.abl)
+-            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, x_raw_f16=act_raw)
++            y_dn = ablate(self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, x_raw_f16=act_raw), self.abl)
              out = mx.sum(y_dn.reshape(N, 8, 2304) * w_norm.reshape(N, 8, 1), axis=1)
              return out.reshape(B, T, H)
  
-@@ -781,6 +802,7 @@ class PackedMoE:
+@@ -1099,6 +1118,7 @@ class PackedMoE:
              )
              y_dn_total = y_nv if y_dn_total is None else (y_dn_total + y_nv)
  
@@ -268,7 +120,7 @@ index 075de5e..aabedab 100644
          out = mx.sum(y_dn_total.reshape(N, K_top, H) * w_norm[:, :, None], axis=1)
          return out.reshape(B, T, H)
  
-@@ -791,6 +813,8 @@ class PackedEmbed:
+@@ -1109,6 +1129,8 @@ class PackedEmbed:
      """100% GPU-resident packed token embedding lookup (zero CPU sync on H=2304; NumPy fallback for mini tests)."""
  
      def __init__(self, packed_dir: Path, luts: dict[str, mx.array], embed_norm_w: mx.array, eps: float):
@@ -277,7 +129,7 @@ index 075de5e..aabedab 100644
          self.meta = json.loads((packed_dir / "embed_meta.json").read_text())
          npz = np.load(packed_dir / "embed_packed.npz")
          order = np.array(npz["order"], dtype=np.int32)
-@@ -905,12 +929,14 @@ class PackedEmbed:
+@@ -1223,12 +1245,14 @@ class PackedEmbed:
                  ids_mx, self.inv_order_mx, self.gpu_b_hi, self.gpu_b_dims,
                  self.gpu_codes, self.gpu_scales, self.gpu_levels, self.gpu_rtr_luts, self.nb,
              )
@@ -296,7 +148,7 @@ index 075de5e..aabedab 100644
  
  
  class PackedLMHead:
-@@ -1308,6 +1334,7 @@ class PackedDecoderLayer:
+@@ -1626,6 +1650,7 @@ class PackedDecoderLayer:
          st: dict[str, mx.array],
      ):
          self.layer_idx = layer_idx
@@ -304,7 +156,7 @@ index 075de5e..aabedab 100644
          self.cfg = cfg
          self._fast = cfg.use_fast_metal and fast_luts is not None
          self.is_sliding = layer_idx in cfg.local_layer_ids
-@@ -1548,6 +1575,7 @@ class PackedDecoderLayer:
+@@ -1877,6 +1902,7 @@ class PackedDecoderLayer:
          o_out = self.o_stage.matmul_rotated_f16(o_rot, T, W_cached=o_w_cached)
          if self.o_out_rot is not None:
              o_out = rht_apply_out(o_out, self.o_out_rot)
@@ -312,7 +164,7 @@ index 075de5e..aabedab 100644
          pa_prev = cache.get_conv_prev(cache_slot, 2, 2304)
          if self.is_block_boundary:
              h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=None, tree_lag=tree_lag)
-@@ -1655,7 +1683,7 @@ class PackedDecoderLayer:
+@@ -1988,7 +2014,7 @@ class PackedDecoderLayer:
          )
  
          gate = mx.sigmoid(self.o_gate(q_in))
@@ -321,16 +173,21 @@ index 075de5e..aabedab 100644
          attn_out = short_conv(attn_out, self.post_attn_conv_w, cache, cache_slot, 2)
  
          if self.is_block_boundary:
-@@ -1701,6 +1729,12 @@ class Inkling2LoopPackedMLX:
+@@ -2033,6 +2059,17 @@ class Inkling2LoopPackedMLX:
+         self.message_in_q = self.st["model.message_input.query"].astype(mx.float32)
          self.layers = [PackedDecoderLayer(i, self.cfg, self.packed_dir, self.luts, self.fast_luts, self.st) for i in range(self.cfg.num_hidden_layers)]
          self.lm_head = PackedLMHead(self.packed_dir, self.luts, self.fast_luts, self.cfg.final_logit_softcapping, self.cfg.hidden_size)
- 
++        _abl_path = os.environ.get("INKLING_ABLATE", "").strip()
++        if _abl_path:
++            _z = np.load(_abl_path)
++            _u = lambda v: mx.array((v / np.linalg.norm(v)).astype(np.float32))
++            self.set_ablation(([_u(v) for v in _z["layers"]], _u(_z["embd"])))
++
 +    def set_ablation(self, dirs: tuple[list[mx.array], mx.array] | None):
 +        """Project unit directions out of every residual write: dirs = (per-layer [24], embedding), or None to turn it off."""
 +        for i, L in enumerate(self.layers):
 +            L.abl = L.moe.abl = None if dirs is None else dirs[0][i]
 +        self.embed.abl = None if dirs is None else dirs[1]
-+
+ 
      def make_cache(self) -> Inkling2Cache:
          return Inkling2Cache(self.cfg)
- 

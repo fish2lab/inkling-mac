@@ -1,0 +1,25 @@
+#!/bin/sh
+# Start Splash 1.7+: OpenAI/Anthropic-compatible endpoint at http://127.0.0.1:9933/v1, model id inkling-2-mini-splash.
+# Serves AtomicChat Inkling-2-Mini Uncensored AD-IQ3_S (GGUF) + DFlash2 speculative decoding + BF16 vision projector.
+# Normally ~/dotfiles/pi/extensions/local-llm.ts starts it on demand and stops it when the last pi exits.
+set -eu
+HUB="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+AC_SNAP="$HUB/models--AtomicChat--Inkling-2-Mini-Uncensored-GGUF/snapshots/c5667da36fe35da026fbee394d00547a921e98ab"
+MODEL_GGUF="${SPLASH_MODEL_GGUF:-$AC_SNAP/Inkling-2-Mini-Uncensored-AD-IQ3_S.gguf}"
+MMPROJ="${SPLASH_MMPROJ:-$AC_SNAP/mmproj-Inkling-2-Mini-Uncensored-BF16.gguf}"
+DRAFT="${SPLASH_DRAFT_DIR:-$HUB/models--incoai--Inkling-2-Mini-DFlash2/snapshots/4f9088ea66c21f2b99ed657d1941c306b03e84d2}"
+[ -f "$MODEL_GGUF" ] || { echo "GGUF not found: $MODEL_GGUF" >&2; exit 1; }
+[ -d "$DRAFT" ] || { echo "DFlash2 draft not found: $DRAFT" >&2; exit 1; }
+
+exec /opt/homebrew/bin/splash serve \
+  --model AtomicChat/Inkling-2-Mini-Uncensored-GGUF:AD-IQ3_S \
+  --model-dir "$MODEL_GGUF" \
+  --mmproj "$MMPROJ" \
+  --draft-model "$DRAFT" \
+  --served-model-name inkling-2-mini-splash --announce-served-name \
+  --host 127.0.0.1 --port "${SPLASH_PORT:-9933}" \
+  --no-webui \
+  --max-memory "${SPLASH_MAX_MEMORY:-15.5G}" \
+  --max-context "${SPLASH_MAX_CONTEXT:-81920}" \
+  --idle-release "${SPLASH_IDLE_RELEASE:-10m}" \
+  "$@"

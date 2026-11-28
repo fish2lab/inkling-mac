@@ -1,18 +1,21 @@
 #!/bin/sh
 # Start the OpenAI-compatible server: http://127.0.0.1:${INKLING_LAMQ_PORT:-9932}/v1, model id inkling-2-mini-lamq.
 # Extra arguments go to server.py (e.g. --preload, --idle 0 to never unload). Environment overrides:
-#   INKLING_MAC_HOME   install prefix used by install.sh (default ~/.local/share/inkling-mac)
-#   INKLING_LAMQ_MODEL lamq packed model directory   (default: pinned revision in the HF cache)
-#   INKLING_MMPROJ     vision projector GGUF          (default: pinned revision in the HF cache)
-#   INKLING_ABLATE     refusal directions npz; set to an empty string to serve the unmodified model
+#   INKLING_MAC_HOME      install prefix used by install.sh (default ~/.local/share/inkling-mac)
+#   INKLING_LAMQ_MODEL    lamq packed model directory (default: 11.2GB v5 in the HF cache)
+#   INKLING_LAMQ_DRAFTER  DSpark 4-bit drafter directory; set to empty string to disable speculative decoding
+#   INKLING_MMPROJ        vision projector GGUF
+#   INKLING_ABLATE        refusal directions npz; set to empty string to serve the unmodified model
 HERE=$(cd "$(dirname "$0")" && pwd)
 HOME_DIR="${INKLING_MAC_HOME:-$HOME/.local/share/inkling-mac}"
 HUB="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
-MODEL="${INKLING_LAMQ_MODEL:-$HUB/models--shinmegamiboson--Inkling-2-Mini-LookAtMyQuant-8.9GB/snapshots/1df3390e09eae0f4a93d4c05db80d1f054da7dbd}"
+MODEL="${INKLING_LAMQ_MODEL:-$HUB/models--shinmegamiboson--Inkling-2-Mini-LookAtMyQuant-11.2GB/snapshots/7191658901060d7c80871eb27413010c3e563b8c}"
+DRAFTER="${INKLING_LAMQ_DRAFTER-$HUB/models--shinmegamiboson--Inkling-2-Mini-LookAtMyQuant-drafter/snapshots/04479ce728ca19efd8e16eaafc704742c8a858da}"
 MMPROJ="${INKLING_MMPROJ:-$HUB/models--AtomicChat--Inkling-2-Mini-Uncensored-GGUF/snapshots/40886ab636cabb4decf4998224f790b462ab048e/mmproj-Inkling-2-Mini-Uncensored-F16.gguf}"
 ABLATE="${INKLING_ABLATE-$HERE/ablate-dirs.npz}"
 [ -d "$MODEL" ] || { echo "model not found: $MODEL (run scripts/download-models.sh)" >&2; exit 1; }
 export HF_HUB_OFFLINE=1
+export LAMQ_GLOBAL_KV="${LAMQ_GLOBAL_KV:-fp8}"
 exec "$HOME_DIR/venv/bin/python" "$HERE/server.py" \
-  --model "$MODEL" --mmproj "$MMPROJ" --ablate "$ABLATE" \
-  --port "${INKLING_LAMQ_PORT:-9932}" --ctx 81920 --idle 600 "$@"
+  --model "$MODEL" --drafter "$DRAFTER" --mmproj "$MMPROJ" --ablate "$ABLATE" \
+  --port "${INKLING_LAMQ_PORT:-9932}" --ctx 81920 --mem-budget "${INKLING_MEM_BUDGET:-16.0}" --idle 600 "$@"

@@ -1,19 +1,20 @@
 #!/bin/sh
-# Download the model files into the Hugging Face cache, at the revisions this repo was measured with.
-#   scripts/download-models.sh          lamq 8.9GB (8.3 GiB) + vision projector (0.6 GiB)
-#   scripts/download-models.sh --llama  also AtomicChat's AD-IQ3_S GGUF (13.3 GB) for the llama.cpp backend
-# Uses the hf CLI from the venv that lamq/install.sh creates. Xet high-performance mode with 16 fixed connections (32 was
-# no faster on a ~50 Mbps link): the adaptive default
-# tends to settle at low concurrency on home connections.
+# Download the model files into the Hugging Face cache, at the revisions measured in this repo.
+#   scripts/download-models.sh          lamq 11.2GB v5 + 4-bit DSpark drafter + vision projector
+#   scripts/download-models.sh --splash also AtomicChat AD-IQ3_S GGUF + DFlash2 draft + BF16 mmproj for Splash
+#   scripts/download-models.sh --llama  also AtomicChat AD-IQ3_S GGUF for llama.cpp
 set -eu
 HF="${INKLING_MAC_HOME:-$HOME/.local/share/inkling-mac}/venv/bin/hf"
-[ -x "$HF" ] || { echo "run lamq/install.sh first" >&2; exit 1; }
+[ -x "$HF" ] || HF=$(command -v hf)
 export HF_XET_HIGH_PERFORMANCE=1 HF_XET_FIXED_DOWNLOAD_CONCURRENCY=16
 
-"$HF" download shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB --revision 1df3390e09eae0f4a93d4c05db80d1f054da7dbd
+"$HF" download shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-11.2GB --revision 7191658901060d7c80871eb27413010c3e563b8c
+"$HF" download shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter --revision 04479ce728ca19efd8e16eaafc704742c8a858da
 AC=AtomicChat/Inkling-2-Mini-Uncensored-GGUF
-AC_REV=40886ab636cabb4decf4998224f790b462ab048e
-"$HF" download "$AC" --revision "$AC_REV" --include mmproj-Inkling-2-Mini-Uncensored-F16.gguf
-if [ "${1:-}" = "--llama" ]; then
-  "$HF" download "$AC" --revision "$AC_REV" --include Inkling-2-Mini-Uncensored-AD-IQ3_S.gguf
+"$HF" download "$AC" --revision 40886ab636cabb4decf4998224f790b462ab048e --include mmproj-Inkling-2-Mini-Uncensored-F16.gguf
+if [ "${1:-}" = "--splash" ] || [ "${1:-}" = "--llama" ]; then
+  "$HF" download "$AC" --revision c5667da36fe35da026fbee394d00547a921e98ab --include Inkling-2-Mini-Uncensored-AD-IQ3_S.gguf --include mmproj-Inkling-2-Mini-Uncensored-BF16.gguf
+fi
+if [ "${1:-}" = "--splash" ]; then
+  "$HF" download incoai/Inkling-2-Mini-DFlash2 --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2
 fi

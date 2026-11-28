@@ -87,27 +87,31 @@ def common_prefix(a: list[int], b: list[int]) -> int:
 # ----------------------------------------------------------------------------- prefix cache
 
 class Ckpt:
-    __slots__ = ("pos", "conv", "win")
+    __slots__ = ("pos", "conv", "win", "dstate")
 
-    def __init__(self, pos, conv, win):
-        self.pos, self.conv, self.win = pos, conv, win
+    def __init__(self, pos, conv, win, dstate=None):
+        self.pos, self.conv, self.win, self.dstate = pos, conv, win, dstate
 
 
 class LiveCache:
     """An Inkling2Cache plus the token keys it holds (image tokens are replaced by the negated image hash) and rollback checkpoints."""
 
-    def __init__(self, m):
+    def __init__(self, m, drafter=None):
         self.m = m
+        self.drafter = drafter
         self.cache = m.make_cache()
-        assert self.cache._fast, "prefix rollback assumes lamq's fast-path FP16 KV"
+        assert self.cache._fast, "prefix rollback assumes lamq's fast-path KV"
+        self.dstate = drafter.new_context() if drafter is not None else None
         self.keys: list[int] = []
         self.ckpts: list[Ckpt] = []
 
     def reset(self):
         self.cache = None
         self.ckpts = []
+        self.dstate = None
         gc.collect()
         self.cache = self.m.make_cache()
+        self.dstate = self.drafter.new_context() if self.drafter is not None else None
         self.keys = []
 
     def checkpoint(self):
@@ -120,16 +124,21 @@ class LiveCache:
                 win[s] = mx.contiguous(kv[:, :, c.kv_len[s] - n:c.kv_len[s], :])
         conv = [list(x) for x in c.conv_states]
         mx.eval(list(win.values()), [x for row in conv for x in row if x is not None])
+        dsnap = None
+        if self.drafter is not None and self.dstate is not None:
+            self.drafter.bind_context(self.dstate)
+            dsnap = self.drafter.snapshot_context()
         self.ckpts = [k for k in self.ckpts if k.pos != c.seq_len]
-        self.ckpts.append(Ckpt(c.seq_len, conv, win))
+        self.ckpts.append(Ckpt(c.seq_len, conv, win, dsnap))
         self.ckpts.sort(key=lambda k: k.pos)
         while len(self.ckpts) > MAX_CKPTS:  # keep the earliest (system prompt), drop the next-oldest
             del self.ckpts[1]
 
     def restore(self, ck: Ckpt):
         c, p = self.cache, ck.pos
-        for s, kv in enumerate(c.kv_f16):
-            if kv is None:
+        for s in range(len(c.kv_f16)):
+            has_buf = (c.kv_f16[s] is not None) or (c.kv_u8[s] is not None)
+            if not has_buf:
                 continue
             if c.kv_is_sliding[s]:
                 w = ck.win[s]
@@ -143,6 +152,8 @@ class LiveCache:
                 c.kv_len[s] = p
         c.conv_states = [list(x) for x in ck.conv]
         c.seq_len = p
+        if self.drafter is not None:
+            self.dstate = self.drafter.clone_context(ck.dstate) if ck.dstate is not None else self.drafter.new_context()
         del self.keys[p:]
         self.ckpts = [k for k in self.ckpts if k.pos <= p]
 
@@ -303,7 +314,7 @@ class Engine:
         self.a = a
         self.lock = threading.Lock()
         self.status = "unloaded"
-        self.m = self.tok = self.vision = self.live = self.side = None
+        self.m = self.tok = self.drafter = self.vision = self.live = self.side = None
         self.inj = ImageInjector()
         self.img_cache: OrderedDict[str, mx.array] = OrderedDict()
         self.last_used = time.monotonic()
@@ -316,7 +327,7 @@ class Engine:
             return
         self.status = "loading"
         try:
-            from runtime_mlx.inkling import load_inkling
+            from runtime_mlx.inkling import DSparkDrafterMLX, load_inkling, resolve_drafter_files
             t = time.perf_counter()
             w, tok = load_inkling(self.a.model)
             m = w.inner
@@ -325,29 +336,39 @@ class Engine:
                 unit = lambda v: mx.array((v / np.linalg.norm(v)).astype(np.float32))  # noqa: E731
                 m.set_ablation(([unit(v) for v in z["layers"]], unit(z["embd"])))
             m.embed.inject = self.inj
+            drafter = None
+            if self.a.drafter:
+                wf, dcfg = resolve_drafter_files(Path(self.a.drafter), fallback_config=Path(self.a.model) / "config.json")
+                drafter = DSparkDrafterMLX(wf, dcfg)
             budget = int(self.a.mem_budget * GIB)
             mx.set_wired_limit(min(budget, mx.device_info()["max_recommended_working_set_size"]))
             mx.set_memory_limit(budget)  # soft: MLX frees its cache and waits on queued work before going past it
             mx.set_cache_limit(CACHE_LIMIT)
-            # Warm up: JIT-compile the prefill and single-token decode kernels (otherwise the first request pays ~3 s)
+            # Warm up: JIT-compile prefill and decode kernels (otherwise the first request pays ~3 s)
             c = m.make_cache()
             mx.eval(m.forward_argmax([MSG_USER, C_TEXT] + [13225] * 300, cache=c)[0])
             mx.eval(m.forward_ordered_logits([END_MSG], cache=c)[0])
-            # Global (non-sliding) KV per token: 2 (K, V) x 8 KV heads x 128 x fp16 for every global visit
-            self.kv_per_token = 2 * 8 * 128 * 2 * sum(1 for s, kv in enumerate(c.kv_f16) if kv is not None and not c.kv_is_sliding[s])
+            n_global = sum(
+                1 for s in range(len(c.kv_f16))
+                if not c.kv_is_sliding[s] and ((c.kv_f16[s] is not None) or (c.kv_u8[s] is not None))
+            )
+            kv_mode = getattr(m.cfg, "global_kv_mode", "fp16")
+            bpe = 1.0 if kv_mode == "fp8" else (0.5625 if kv_mode == "q4" else 2.0)
+            self.kv_per_token = int(2 * 8 * 128 * bpe * max(n_global, 8))
             del c
             mx.clear_cache()
             self.base_mem = mx.get_active_memory()
-            self.m, self.tok, self.live, self.side = m, tok, LiveCache(m), None
+            self.m, self.tok, self.drafter = m, tok, drafter
+            self.live, self.side = LiveCache(m, drafter), None
             self.status = "loaded"
             log(f"loaded in {time.perf_counter() - t:.1f}s, active {mx.get_active_memory() / 2**30:.2f} GiB, "
-                f"ablation {'on' if self.a.ablate else 'off'}")
+                f"kv={kv_mode}, drafter={'on' if drafter else 'off'}, ablation {'on' if self.a.ablate else 'off'}")
         except BaseException:
             self.status = "unloaded"
             raise
 
     def unload(self):
-        self.m = self.tok = self.vision = self.live = self.side = None
+        self.m = self.tok = self.drafter = self.vision = self.live = self.side = None
         self.img_cache.clear()
         self.inj.load([])
         gc.collect()
@@ -470,7 +491,7 @@ class Engine:
         temp_cache = discard > 8192 and n - start < 8192 and common_prefix(lc.keys, j.keys) < n // 2
         if temp_cache:  # a small, unrelated request (title, side query): keep the large live cache, use the side slot
             self.side = None
-            lc = self.side = LiveCache(m)
+            lc = self.side = LiveCache(m, self.drafter)
             start = 0
         else:
             start = lc.prepare(j.keys)
@@ -481,6 +502,12 @@ class Engine:
         # draw the same random stream: at temp 1.0 a retried or near-identical turn reproduced the same output exactly.
         mx.random.seed(j.seed if j.seed is not None else int.from_bytes(os.urandom(8), "little"))
         mx.reset_peak_memory()
+        drafter = self.drafter
+        tap_ids = drafter.target_layer_ids if drafter is not None else ()
+        if drafter is not None:
+            if lc.dstate is None or lc.dstate.get("ctx_len", 0) != start:
+                lc.dstate = drafter.new_context()
+            drafter.bind_context(lc.dstate)
         t0 = time.perf_counter()
         cuts = sorted({p for p in (j.sys_pos, n - 1) if start < p < n} | {n})
         pos, logits, aborted = start, None, False
@@ -490,11 +517,21 @@ class Engine:
                     e = min(pos + self.a.chunk, tgt)
                     seg = j.ids[pos:e]
                     if e == n:
-                        logits, _ = m.forward_ordered_logits(seg, cache=lc.cache)
-                        mx.eval(logits)
+                        if tap_ids:
+                            logits, _, taps = m.forward_ordered_logits(seg, cache=lc.cache, tap_visits=tap_ids)
+                            mx.eval(logits, taps)
+                            drafter.push_context(taps, start_pos=pos)
+                        else:
+                            logits, _ = m.forward_ordered_logits(seg, cache=lc.cache)
+                            mx.eval(logits)
                     else:
-                        o, _ = m.forward_argmax(seg, cache=lc.cache)
-                        mx.eval(o)
+                        if tap_ids:
+                            _, _, taps = m.forward_prefill_chunk(seg, cache=lc.cache, tap_visits=tap_ids)
+                            mx.eval(taps)
+                            drafter.push_context(taps, start_pos=pos)
+                        else:
+                            o, _ = m.forward_argmax(seg, cache=lc.cache)
+                            mx.eval(o)
                     lc.keys.extend(j.keys[pos:e])
                     pos = e
                     if e < n:
@@ -505,54 +542,168 @@ class Engine:
                 if aborted:
                     break
                 if tgt < n:
+                    if drafter is not None:
+                        drafter.sync_context_back(lc.dstate)
                     lc.checkpoint()
             self.inj.load([])
+            if drafter is not None and not aborted:
+                mx.eval(drafter.f_rnn)
             t1 = time.perf_counter()
             parser = Parser(self.tok)
             gen, finish = [], "abort" if aborted else "length"
             if not aborted:
                 order, cap = m.lm_head.order_mx, m.lm_head.cap
-                from runtime_mlx.inkling.generate import _sample_ordered_gpu
+                from runtime_mlx.inkling.generate import _sample_ordered_gpu, verify_spec_sample_gpu
 
                 def sample(lg):
                     return _sample_ordered_gpu(lg[0, -1], order, cap=cap, temp=j.temp, top_p=j.top_p, top_k=j.top_k)
 
-                cur = sample(logits)
-                mx.async_eval(cur)
-                nxt = None
-                try:
-                    for i in range(j.max_new):
-                        nxt = None
-                        if i + 1 < j.max_new:
-                            lg, _ = m.forward_ordered_logits(cur.reshape(1), cache=lc.cache)
-                            nxt = sample(lg)
-                            mx.async_eval(nxt)
-                        t = int(cur)
-                        if nxt is not None:
-                            lc.keys.append(t)
-                        gen.append(t)
-                        for d in parser.feed(t):
-                            out.delta(d)
-                        if t == EOS:
+                if drafter is not None:
+                    stochastic = j.temp > 0.0
+                    draft_head_sampler = m.lm_head.get_draft_head_sampler(temp=j.temp, top_p=j.top_p, top_k=j.top_k) if stochastic else None
+                    draft_head = None if stochastic else m.lm_head.get_draft_head_argmax()
+                    cur_block = min(6, drafter.block_size)
+                    ewma_accept = 3.0
+                    serial_cooldown = 0
+
+                    first_mx = sample(logits)
+                    mx.eval(first_mx)
+                    anchor = int(first_mx)
+                    gen.append(anchor)
+                    for d in parser.feed(anchor):
+                        out.delta(d)
+                    if anchor == EOS:
+                        finish = "stop"
+                    elif out.gone():
+                        aborted, finish = True, "abort"
+
+                    while len(gen) < j.max_new and anchor != EOS and not aborted:
+                        base_pos = lc.cache.seq_len
+                        if serial_cooldown > 0:
+                            if stochastic:
+                                lg, _, taps = m.forward_ordered_logits([anchor], cache=lc.cache, tap_visits=tap_ids)
+                                nxt_mx = sample(lg)
+                                mx.eval(nxt_mx, taps)
+                            else:
+                                nxt_mx, _, taps = m.forward_argmax([anchor], cache=lc.cache, tap_visits=tap_ids)
+                                nxt_mx = nxt_mx[0, -1]
+                                mx.eval(nxt_mx, taps)
+                            nxt = int(nxt_mx)
+                            lc.keys.append(anchor)
+                            drafter.push_context(taps, start_pos=base_pos)
+                            serial_cooldown -= 1
+                            gen.append(nxt)
+                            for d in parser.feed(nxt):
+                                out.delta(d)
+                            anchor = nxt
+                            if anchor == EOS:
+                                finish = "stop"
+                                break
+                            if out.gone():
+                                aborted, finish = True, "abort"
+                                break
+                            continue
+
+                        block_size = min(cur_block, max(2, j.max_new - len(gen) + 1))
+                        if stochastic:
+                            draft_gpu, draft_ord, q_probs = drafter.propose_sample_gpu(
+                                anchor, m.embed, draft_head_sampler, draft_len=block_size
+                            )
+                        else:
+                            draft_gpu = drafter.propose_gpu(anchor, m.embed, draft_head, draft_len=block_size)
+                            draft_ord = q_probs = None
+
+                        lc.cache.begin_spec_verify()
+                        if stochastic:
+                            ord_lg, _, ver_taps = m.forward_all_ordered_logits(draft_gpu, cache=lc.cache, tap_visits=tap_ids)
+                            k_match_mx, final_tok_mx = verify_spec_sample_gpu(
+                                ord_lg[0], order, draft_ord, q_probs, cap=cap, temp=j.temp, top_p=j.top_p, top_k=j.top_k
+                            )
+                            mx.eval(draft_gpu, k_match_mx, final_tok_mx, ver_taps)
+                            draft_block = np.array(draft_gpu, dtype=np.int32).tolist()
+                            k_match = int(k_match_mx)
+                            raw = draft_block[1 : k_match + 1] + [int(final_tok_mx)]
+                        else:
+                            ver_preds_mx, _, ver_taps = m.forward_all_argmax(draft_gpu, cache=lc.cache, tap_visits=tap_ids)
+                            mx.eval(draft_gpu, ver_preds_mx, ver_taps)
+                            draft_block = np.array(draft_gpu, dtype=np.int32).tolist()
+                            preds = np.array(ver_preds_mx[0], dtype=np.int32).tolist()
+                            k_match = 0
+                            for idx_m in range(1, block_size):
+                                if preds[idx_m - 1] == draft_block[idx_m]:
+                                    k_match += 1
+                                else:
+                                    break
+                            raw = draft_block[1 : k_match + 1] + [preds[k_match]]
+
+                        emitted_now = []
+                        hit_eos = False
+                        for tok_id in raw:
+                            if len(gen) + len(emitted_now) >= j.max_new:
+                                break
+                            emitted_now.append(tok_id)
+                            if tok_id == EOS:
+                                hit_eos = True
+                                break
+                        m_commit = max(1, len(emitted_now))
+                        lc.cache.commit_spec_verify(m_commit, block_size)
+                        lc.keys.extend(draft_block[:m_commit])
+                        drafter.push_context(ver_taps[:m_commit], start_pos=base_pos)
+
+                        ewma_accept = 0.7 * ewma_accept + 0.3 * len(raw)
+                        if ewma_accept < 1.5:
+                            serial_cooldown = 8
+
+                        for tok_id in emitted_now:
+                            gen.append(tok_id)
+                            for d in parser.feed(tok_id):
+                                out.delta(d)
+                        anchor = emitted_now[-1]
+                        if hit_eos:
                             finish = "stop"
                             break
                         if out.gone():
                             aborted, finish = True, "abort"
                             break
-                        cur = nxt
-                finally:
-                    if nxt is not None:
-                        mx.eval(nxt)
+                else:
+                    cur = sample(logits)
+                    mx.async_eval(cur)
+                    nxt = None
+                    try:
+                        for i in range(j.max_new):
+                            nxt = None
+                            if i + 1 < j.max_new:
+                                lg, _ = m.forward_ordered_logits(cur.reshape(1), cache=lc.cache)
+                                nxt = sample(lg)
+                                mx.async_eval(nxt)
+                            t = int(cur)
+                            if nxt is not None:
+                                lc.keys.append(t)
+                            gen.append(t)
+                            for d in parser.feed(t):
+                                out.delta(d)
+                            if t == EOS:
+                                finish = "stop"
+                                break
+                            if out.gone():
+                                aborted, finish = True, "abort"
+                                break
+                            cur = nxt
+                    finally:
+                        if nxt is not None:
+                            mx.eval(nxt)
                 for d in parser._close():
                     out.delta(d)
                 if parser.n_calls and finish == "stop":
                     finish = "tool_calls"
+            if drafter is not None:
+                drafter.sync_context_back(lc.dstate)
             t2 = time.perf_counter()
         except BaseException:
             if lc is self.side:  # cache state is unknown after a failure; a side cache leaves the live one intact
                 self.side = None
             elif lc is self.live:
-                self.live = LiveCache(m) if self.m is not None else None
+                self.live = LiveCache(m, self.drafter) if self.m is not None else None
             raise
         finally:
             self.inj.load([])
@@ -752,6 +903,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", required=True, help="lamq packed model directory")
+    ap.add_argument("--drafter", default="", help="DSpark 4-bit drafter directory; empty disables speculative decoding")
     ap.add_argument("--mmproj", required=True, help="Inkling 2 mmproj GGUF (llama.cpp)")
     ap.add_argument("--ablate", default="", help="refusal directions npz (layers [24,2304], embd); empty disables")
     ap.add_argument("--host", default="127.0.0.1")

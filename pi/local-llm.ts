@@ -30,13 +30,14 @@ const HOME = homedir();
 const REPO = process.env.INKLING_MAC_REPO ?? dirname(dirname(realpathSync(fileURLToPath(import.meta.url))));
 const RUN = join(HOME, ".cache/inkling-mac");
 const LEASES = join(RUN, "sessions");
-const START_TIMEOUT_MS = 30_000;
+const START_TIMEOUT_MS = 90_000;
 const STOP_TIMEOUT_MS = 8_000;
 const STATUS_KEY = "local-llm";
 
 type Backend = {
   provider: string;
   base: string;
+  healthPath: string;
   launcher: string;
   log: string;
   /** Command-line check: is this process the one we started (not some other process that reused the pid)? */
@@ -47,6 +48,7 @@ const BACKENDS: Backend[] = [
   {
     provider: "local",
     base: "http://127.0.0.1:9931",
+    healthPath: "/health",
     launcher: join(REPO, "llama.cpp/router"),
     log: join(HOME, "Library/Logs/inkling-mac-llama.log"),
     owns: (cmd) => cmd.includes("--models-preset") && cmd.includes("--port 9931"),
@@ -54,9 +56,18 @@ const BACKENDS: Backend[] = [
   {
     provider: "lamq",
     base: "http://127.0.0.1:9932",
+    healthPath: "/health",
     launcher: join(REPO, "lamq/lamq-server"),
     log: join(HOME, "Library/Logs/inkling-mac-lamq.log"),
     owns: (cmd) => cmd.includes(join(REPO, "lamq/server.py")),
+  },
+  {
+    provider: "splash",
+    base: "http://127.0.0.1:9933",
+    healthPath: "/ready",
+    launcher: join(REPO, "splash/splash-server"),
+    log: join(HOME, "Library/Logs/inkling-mac-splash.log"),
+    owns: (cmd) => cmd.includes("splash") && cmd.includes("9933"),
   },
 ];
 
@@ -93,11 +104,12 @@ function owned(b: Backend): ProcRecord | undefined {
   return b.owns(command(rec.pid)) ? rec : undefined;
 }
 
-/** true if the backend accepts connections; false if the connection is refused (no listener). Other errors are thrown rather than taking over the port. */
+/** true if the backend responds 2xx on its readiness path; false if not listening or 503 (still loading). Other errors are thrown rather than taking over the port. */
 async function reachable(b: Backend): Promise<boolean> {
   try {
-    await fetch(`${b.base}/health`, { signal: AbortSignal.timeout(1500) });
-    return true;
+    const r = await fetch(`${b.base}${b.healthPath}`, { signal: AbortSignal.timeout(1500) });
+    if (r.status === 503) return false;
+    return r.ok;
   } catch (e: any) {
     if (e?.cause?.code === "ECONNREFUSED") return false;
     throw new Error(`port ${new URL(b.base).port} is taken by a process that does not respond: ${e?.cause?.code ?? e?.message ?? e}`);
